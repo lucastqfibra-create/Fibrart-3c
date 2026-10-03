@@ -100,8 +100,8 @@ def processar_e_enviar():
             # Converte o áudio para base64
             audio_base64 = base64.b64encode(resp_audio.content).decode("utf-8")
 
-            # 2. Envio REST direto para o Gemini 3.8 Flash (compatível com a chave AQ.)
-            print("Enviando áudio diretamente para a API REST do Gemini 3.8 Flash...")
+            # 2. Envio REST com retentativa automática em caso de pico (HTTP 503)
+            print("Enviando áudio para o Gemini 3.8 Flash...")
             gemini_payload = {
                 "contents": [
                     {
@@ -119,17 +119,23 @@ def processar_e_enviar():
             }
             
             gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
-            resp_gemini = requests.post(gemini_url, json=gemini_payload, timeout=90)
+            
+            # Tenta até 3 vezes com pausa de 3 segundos se houver pico no Google
+            max_tentativas = 3
+            resp_gemini = None
+            for tentativa in range(1, max_tentativas + 1):
+                resp_gemini = requests.post(gemini_url, json=gemini_payload, timeout=90)
+                if resp_gemini.status_code == 503 and tentativa < max_tentativas:
+                    print(f"Pico temporário no Google (503). Aguardando 3s para tentar novamente ({tentativa}/{max_tentativas})...")
+                    import time
+                    time.sleep(3)
+                    continue
+                break
+
             resp_gemini.raise_for_status()
             
             dados_gemini = resp_gemini.json()
             texto_analise = dados_gemini["candidates"][0]["content"]["parts"][0]["text"]
-            
-            texto_limpo = texto_analise.strip().replace("```json", "").replace("```", "")
-            try:
-                analise_json = json.loads(texto_limpo)
-            except Exception:
-                analise_json = {"analise_texto": texto_analise}
 
             # 3. Pacote para entrega no Google Docs
             registro = {
