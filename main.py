@@ -6,13 +6,17 @@ from datetime import datetime, timedelta
 from google import genai
 
 # ==============================================================
-# CONFIGURAÇÕES (Lidas com segurança dos Secrets do GitHub)
+# CONFIGURAÇÕES (Lidas dos Secrets do GitHub)
 # ==============================================================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-TOKEN_3C_PLUS = os.getenv("TOKEN_3C_PLUS") # Token de Gestor da 3C Plus
+TOKEN_3C_PLUS = os.getenv("TOKEN_3C_PLUS")
 GOOGLE_DOCS_WEBHOOK_URL = os.getenv("GOOGLE_DOCS_WEBHOOK_URL")
 
+# Cliente do Gemini
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+# URL da API oficial da Fibrart no 3C Plus
+BASE_URL_3C = "https://fibrartindustria.3c.plus/api/v1"
 
 PROMPT_ANALISE = """
 Você é um especialista em qualidade e conversão de telemarketing e vendas de marmofibra (tanques e pias).
@@ -30,18 +34,39 @@ Retorne estritamente o JSON sem blocos markdown.
 """
 
 def buscar_ligacoes_3c(data_alvo):
-    """Consulta a API oficial da 3C Plus para obter as ligações do dia."""
-    url = f"https://app.3c.plus/api/v1/calls?api_token={TOKEN_3C_PLUS}&start_date={data_alvo}&end_date={data_alvo}"
-    print(f"Buscando ligações no 3C Plus para a data: {data_alvo}...")
+    """Consulta a API oficial da Fibrart na 3C Plus para obter as ligações do dia."""
+    url = f"{BASE_URL_3C}/calls"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {TOKEN_3C_PLUS}"
+    }
+    params = {
+        "api_token": TOKEN_3C_PLUS,
+        "start_date": data_alvo,
+        "end_date": data_alvo
+    }
     
-    headers = {"Accept": "application/json"}
-    response = requests.get(url, headers=headers, timeout=60)
-    response.raise_for_status()
+    print(f"Conectando a {url} para a data {data_alvo}...")
+    response = requests.get(url, params=params, headers=headers, timeout=60)
     
+    if not response.ok:
+        print(f"\n[DIAGNÓSTICO 3C PLUS - HTTP {response.status_code}]:")
+        print(response.text)
+        print("-" * 50)
+        # Tentativa com horário completo caso a API exija
+        params_com_hora = {
+            "api_token": TOKEN_3C_PLUS,
+            "start_date": f"{data_alvo} 00:00:00",
+            "end_date": f"{data_alvo} 23:59:59"
+        }
+        response = requests.get(url, params=params_com_hora, headers=headers, timeout=60)
+        if not response.ok:
+            print(f"Tentativa com formato de hora também falhou: {response.text}")
+            response.raise_for_status()
+
     dados = response.json()
-    # A depender do formato da 3C Plus, pega a lista em 'data' ou raiz
     ligacoes = dados.get("data", dados) if isinstance(dados, dict) else dados
-    print(f"Total de chamadas encontradas na API: {len(ligacoes)}")
+    print(f"Sucesso! Total de chamadas retornadas pela API da Fibrart: {len(ligacoes)}")
     return ligacoes
 
 def processar_e_enviar():
@@ -51,9 +76,9 @@ def processar_e_enviar():
 
     ligacoes = buscar_ligacoes_3c(data_alvo)
     
-    # Filtra apenas ligações finalizadas com áudio gravado
-    chamadas_com_audio = [c for c in ligacoes if c.get("recording") and c.get("status") == 7 or c.get("speaking_with_agent_time")]
-    print(f"Chamadas com gravação e conversação ativa: {len(chamadas_com_audio)}")
+    # Filtra apenas ligações finalizadas que possuem gravação de áudio
+    chamadas_com_audio = [c for c in ligacoes if c.get("recording")]
+    print(f"Chamadas com gravação de áudio disponíveis: {len(chamadas_com_audio)}")
 
     for chamada in chamadas_com_audio:
         call_id = chamada.get("id")
@@ -66,9 +91,11 @@ def processar_e_enviar():
         
         temp_audio_path = None
         try:
-            # 1. Download do áudio com o token da 3C Plus
+            # 1. Download do áudio via API
             audio_url = f"{recording_url}?api_token={TOKEN_3C_PLUS}" if "api_token" not in recording_url else recording_url
-            resp_audio = requests.get(audio_url, stream=True, timeout=60)
+            headers_audio = {"Authorization": f"Bearer {TOKEN_3C_PLUS}"}
+            
+            resp_audio = requests.get(audio_url, headers=headers_audio, stream=True, timeout=60)
             resp_audio.raise_for_status()
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
@@ -76,7 +103,7 @@ def processar_e_enviar():
                     tmp_file.write(chunk)
                 temp_audio_path = tmp_file.name
 
-            # 2. Upload e Análise com o Gemini
+            # 2. Upload e Análise com o Gemini 3.8 Flash
             print("Enviando áudio para o Gemini 3.8 Flash...")
             uploaded_file = client.files.upload(file=temp_audio_path)
             
@@ -91,7 +118,7 @@ def processar_e_enviar():
             except Exception:
                 analise_json = {"analise_texto": resposta.text}
 
-            # 3. Monta o payload para o Google Docs
+            # 3. Pacote para entrega no Google Docs
             registro = {
                 "id": call_id,
                 "data_hora": chamada.get("call_date", data_alvo),
@@ -101,10 +128,10 @@ def processar_e_enviar():
                 "analise": analise_json
             }
 
-            # 4. Envia direto para o Google Apps Script do Google Docs
+            # 4. Envio direto para o Webhook do Google Docs
             print("Entregando análise no Google Docs...")
             resp_doc = requests.post(GOOGLE_DOCS_WEBHOOK_URL, json=registro, timeout=30)
-            print(f"Status no Google Docs: {resp_doc.status_code}")
+            print(f"Status da entrega no Google Docs: {resp_doc.status_code}")
 
         except Exception as e:
             print(f"Erro ao processar chamada {call_id}: {e}")
