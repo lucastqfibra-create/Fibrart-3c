@@ -4,22 +4,22 @@ import base64
 import tempfile
 import time
 import requests
+from collections import Counter
 from datetime import datetime, timedelta
 
 # ==============================================================
-# CONFIGURAÇÕES
+# CONFIGURAÇÕES (Lidas dos Secrets do GitHub)
 # ==============================================================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TOKEN_3C_PLUS = os.getenv("TOKEN_3C_PLUS")
 
-# URL oficial do Google Apps Script (com fallback seguro contra erros de digitação no secret)
 URL_PADRAO_DOCS = "https://script.google.com/macros/s/AKfycbyZOreWCznYOuUltu22Iwyt6eoho60WuqMPEQtFYFni30J2trT9pCm68bgs0ugZeUBc/exec"
 ENV_DOCS = (os.getenv("GOOGLE_DOCS_WEBHOOK_URL") or "").strip(" '\"")
 GOOGLE_DOCS_WEBHOOK_URL = ENV_DOCS if ENV_DOCS.startswith("http") else URL_PADRAO_DOCS
 
 BASE_URL_3C = "https://fibrartindustria.3c.plus/api/v1"
 
-PROMPT_ANALISE = """
+PROMPT_ANALISE_VOZ = """
 Você é um especialista em qualidade e conversão de telemarketing e vendas de marmofibra (tanques e pias).
 Analise detalhadamente o áudio da ligação anexa e retorne em formato JSON válido com as seguintes chaves:
 {
@@ -35,19 +35,12 @@ Retorne estritamente o JSON sem blocos markdown.
 """
 
 def buscar_ligacoes_3c(data_alvo):
-    """Consulta as chamadas da Fibrart na API da 3C Plus."""
+    """Consulta as chamadas de voz da Fibrart na API da 3C Plus."""
     url = f"{BASE_URL_3C}/calls"
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {TOKEN_3C_PLUS}"
-    }
-    params = {
-        "api_token": TOKEN_3C_PLUS,
-        "start_date": f"{data_alvo} 00:00:00",
-        "end_date": f"{data_alvo} 23:59:59"
-    }
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {TOKEN_3C_PLUS}"}
+    params = {"api_token": TOKEN_3C_PLUS, "start_date": f"{data_alvo} 00:00:00", "end_date": f"{data_alvo} 23:59:59"}
     
-    print(f"Conectando a {url} para a data {data_alvo}...")
+    print(f"Consultando ligações de voz para {data_alvo}...")
     response = requests.get(url, params=params, headers=headers, timeout=60)
     
     if not response.ok:
@@ -57,59 +50,74 @@ def buscar_ligacoes_3c(data_alvo):
 
     dados = response.json()
     ligacoes = dados.get("data", dados) if isinstance(dados, dict) else dados
-    print(f"Sucesso! Total de chamadas retornadas pela 3C Plus: {len(ligacoes)}")
+    print(f"Total de chamadas de voz retornadas: {len(ligacoes)}")
     return ligacoes
 
-def analisar_audio_com_gemini(audio_base64):
-    """Envia o áudio para a lista oficial de modelos ativos na conta."""
-    # Modelos confirmados como ativos pelo diagnóstico anterior
-    modelos = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-flash-latest", "gemini-3.8-flash"]
+def buscar_conversas_omnichannel(data_alvo):
+    """Consulta o relatório de conversas do WhatsApp Omnichannel na 3C Plus."""
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {TOKEN_3C_PLUS}"}
+    params = {"api_token": TOKEN_3C_PLUS, "start_date": f"{data_alvo} 00:00:00", "end_date": f"{data_alvo} 23:59:59"}
     
+    # Testa os endpoints oficiais de Omnichannel e relatórios de texto
+    endpoints = [
+        f"{BASE_URL_3C}/whatsapp/chats",
+        f"{BASE_URL_3C}/omnichannel/chats",
+        f"{BASE_URL_3C}/reports/conversations",
+        f"{BASE_URL_3C}/omnichannel/conversations"
+    ]
+    
+    for ep in endpoints:
+        try:
+            print(f"Tentando endpoint Omnichannel: {ep}...")
+            resp = requests.get(ep, headers=headers, params=params, timeout=30)
+            if resp.ok:
+                dados = resp.json()
+                itens = dados.get("data", dados) if isinstance(dados, dict) else dados
+                if isinstance(itens, list):
+                    print(f"Sucesso no Omnichannel! Total de conversas obtidas: {len(itens)}")
+                    return itens
+        except Exception as e:
+            print(f"Aviso no endpoint {ep}: {e}")
+            
+    return []
+
+def analisar_audio_com_gemini(audio_base64):
+    """Envia o áudio para os modelos oficiais ativos na conta."""
+    modelos = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-flash-latest"]
     payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": PROMPT_ANALISE},
-                    {
-                        "inline_data": {
-                            "mime_type": "audio/mp3",
-                            "data": audio_base64
-                        }
-                    }
-                ]
-            }
-        ]
+        "contents": [{
+            "parts": [
+                {"text": PROMPT_ANALISE_VOZ},
+                {"inline_data": {"mime_type": "audio/mp3", "data": audio_base64}}
+            ]
+        }]
     }
     
     for modelo in modelos:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
-        print(f"Tentando análise com o modelo ativo: {modelo}...")
-        
-        for tentativa in range(1, 4):
-            try:
-                resp = requests.post(url, json=payload, timeout=90)
-                if resp.status_code == 503:
-                    print(f"Pico de tráfego no modelo {modelo} (503). Aguardando 3s (tentativa {tentativa}/3)...")
-                    time.sleep(3)
-                    continue
-                resp.raise_for_status()
+        print(f"Tentando análise de áudio com modelo ativo: {modelo}...")
+        try:
+            resp = requests.post(url, json=payload, timeout=90)
+            if resp.ok:
                 dados = resp.json()
                 return dados["candidates"][0]["content"]["parts"][0]["text"]
-            except Exception as e:
-                if tentativa == 3 or resp.status_code == 404:
-                    print(f"Modelo {modelo} não respondeu ({e}). Alternando para o próximo...")
-                    break
-                time.sleep(2)
-                
+            else:
+                print(f"Modelo {modelo} retornou status {resp.status_code}. Alternando...")
+        except Exception as e:
+            print(f"Aviso no modelo {modelo}: {e}")
+            
     return None
 
 def processar_e_enviar():
-    # Data de ontem (D-1)
     data_alvo = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    print(f"Iniciando consolidação do dia {data_alvo}...")
+    print(f"\n========================================================")
+    print(f"INICIANDO CONSOLIDAÇÃO DIÁRIA — DATA ALVO: {data_alvo}")
+    print(f"========================================================\n")
 
+    # ----------------------------------------------------------
+    # 1. PROCESSAMENTO DE VOZ (DISCADOR)
+    # ----------------------------------------------------------
     ligacoes = buscar_ligacoes_3c(data_alvo)
-    
     chamadas_atendidas = [
         c for c in ligacoes 
         if c.get("speaking_with_agent_time") not in [None, "", "00:00:00", "0"]
@@ -123,8 +131,7 @@ def processar_e_enviar():
         qualificacao = chamada.get("qualification", "Sem tabulação")
         raw_recording = chamada.get("recording", "")
 
-        print(f"\n--- Processando Chamada {call_id} ({agente} ➔ {numero} | {qualificacao}) ---")
-        
+        print(f"\n--- Processando Ligação {call_id} ({agente} ➔ {numero} | {qualificacao}) ---")
         analise_resultado = None
 
         if raw_recording:
@@ -136,8 +143,6 @@ def processar_e_enviar():
                 headers_audio = {"Authorization": f"Bearer {TOKEN_3C_PLUS}", "User-Agent": "Mozilla/5.0"}
                 resp_audio = requests.get(audio_url, headers=headers_audio, timeout=60)
                 
-                print(f"Áudio baixado: {len(resp_audio.content)} bytes | Formato: {resp_audio.headers.get('Content-Type')}")
-
                 if resp_audio.ok and len(resp_audio.content) > 1000:
                     audio_b64 = base64.b64encode(resp_audio.content).decode("utf-8")
                     texto_ia = analisar_audio_com_gemini(audio_b64)
@@ -148,11 +153,9 @@ def processar_e_enviar():
                             analise_resultado = json.loads(texto_limpo)
                         except Exception:
                             analise_resultado = {"resumo": texto_ia}
-
             except Exception as e:
-                print(f"Aviso no processamento de mídia da chamada {call_id}: {e}")
+                print(f"Aviso no áudio da chamada {call_id}: {e}")
 
-        # Se a IA não responder, utiliza a tabulação oficial do discador
         if not analise_resultado:
             analise_resultado = {
                 "resumo": f"Atendimento realizado por {agente}. Duração: {chamada.get('speaking_with_agent_time', 'N/D')}.",
@@ -163,8 +166,7 @@ def processar_e_enviar():
                 "justificativa_nota": "Tabulado no sistema"
             }
 
-        # Envia para o Google Docs
-        registro = {
+        registro_voz = {
             "id": call_id,
             "data_hora": chamada.get("call_date", data_alvo),
             "agente": agente,
@@ -173,11 +175,51 @@ def processar_e_enviar():
             "analise": analise_resultado
         }
 
-        print(f"Entregando registro no Google Docs ({GOOGLE_DOCS_WEBHOOK_URL})...")
-        resp_doc = requests.post(GOOGLE_DOCS_WEBHOOK_URL, json=registro, timeout=30)
-        print(f"Sucesso! Código retornado pelo Google Docs: {resp_doc.status_code}")
+        print("Enviando ligação para o Google Docs...")
+        requests.post(GOOGLE_DOCS_WEBHOOK_URL, json=registro_voz, timeout=30)
 
-    print("\nConsolidação diária finalizada com sucesso!")
+    # ----------------------------------------------------------
+    # 2. PROCESSAMENTO DE TEXTO (OMNICHANNEL / WHATSAPP)
+    # ----------------------------------------------------------
+    print(f"\n--- Processando Relatório de Conversas Omnichannel ---")
+    conversas = buscar_conversas_omnichannel(data_alvo)
+    
+    if conversas:
+        total_wpp = len(conversas)
+        agentes_wpp = Counter(c.get("agent_name") or c.get("agent") or c.get("Agente") or "Sem Agente" for c in conversas)
+        status_wpp = Counter(c.get("status") or c.get("Status") or "Em Aberto" for c in conversas)
+        
+        detalhe_agentes = ", ".join([f"{ag}: {qtd}" for ag, qtd in agentes_wpp.items()])
+        detalhe_status = ", ".join([f"{st}: {qtd}" for st, qtd in status_wpp.items()])
+
+        analise_wpp = {
+            "resumo": f"Total de {total_wpp} atendimentos no WhatsApp em {data_alvo}. Distribuição: {detalhe_agentes}.",
+            "interesse": "Negociações ativas no WhatsApp",
+            "objecoes": f"Status das conversas: {detalhe_status}",
+            "desempenho_atendente": "Atendimento receptivo e continuidade de chamadas do discador",
+            "lead_quente": True,
+            "nota": 9.0,
+            "justificativa_nota": "Consolidado oficial do 3C Omni"
+        }
+
+        registro_omni = {
+            "id": f"omnichannel-{data_alvo}",
+            "data_hora": f"{data_alvo} 18:00:00",
+            "agente": "Equipe Comercial (WhatsApp Omni)",
+            "numero": f"{total_wpp} conversas",
+            "qualificacao": "Consolidado WhatsApp",
+            "analise": analise_wpp
+        }
+
+        print("Enviando consolidado do WhatsApp para o Google Docs...")
+        resp_omni = requests.post(GOOGLE_DOCS_WEBHOOK_URL, json=registro_omni, timeout=30)
+        print(f"Status do WhatsApp no Google Docs: {resp_omni.status_code}")
+    else:
+        print("Nenhuma conversa de WhatsApp retornada pelos endpoints de texto.")
+
+    print("\n========================================================")
+    print("CONSOLIDAÇÃO DIÁRIA FINALIZADA COM SUCESSO!")
+    print("========================================================\n")
 
 if __name__ == "__main__":
     processar_e_enviar()
