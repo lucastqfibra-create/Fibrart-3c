@@ -17,7 +17,7 @@ URL_PADRAO_DOCS = "https://script.google.com/macros/s/AKfycbyZOreWCznYOuUltu22Iw
 ENV_DOCS = (os.getenv("GOOGLE_DOCS_WEBHOOK_URL") or "").strip(" '\"")
 GOOGLE_DOCS_WEBHOOK_URL = ENV_DOCS if ENV_DOCS.startswith("http") else URL_PADRAO_DOCS
 
-BASE_URL_3C = "https://fibrartindustria.3c.plus/api/v1"
+DOMINIO_FIBRART = "https://fibrartindustria.3c.plus"
 
 PROMPT_ANALISE_VOZ = """
 Você é um especialista em qualidade e conversão de telemarketing e vendas de marmofibra (tanques e pias).
@@ -36,7 +36,7 @@ Retorne estritamente o JSON sem blocos markdown.
 
 def buscar_ligacoes_3c(data_alvo):
     """Consulta as chamadas de voz da Fibrart na API da 3C Plus."""
-    url = f"{BASE_URL_3C}/calls"
+    url = f"{DOMINIO_FIBRART}/api/v1/calls"
     headers = {"Accept": "application/json", "Authorization": f"Bearer {TOKEN_3C_PLUS}"}
     params = {"api_token": TOKEN_3C_PLUS, "start_date": f"{data_alvo} 00:00:00", "end_date": f"{data_alvo} 23:59:59"}
     
@@ -54,45 +54,43 @@ def buscar_ligacoes_3c(data_alvo):
     return ligacoes
 
 def buscar_conversas_omnichannel(data_alvo):
-    """Consulta o relatório de conversas do Omnichannel (chats-report) na API da 3C Plus."""
+    """Consulta o relatório oficial de conversas do Omnichannel na 3C Plus."""
+    url = f"{DOMINIO_FIBRART}/omni-reports/api/v1/chats"
     headers = {"Accept": "application/json", "Authorization": f"Bearer {TOKEN_3C_PLUS}"}
     
-    # Endpoints baseados na rota /manager/chats-report informada
-    endpoints = [
-        f"{BASE_URL_3C}/chats-report",
-        f"{BASE_URL_3C}/chats_report",
-        f"{BASE_URL_3C}/reports/chats",
-        f"{BASE_URL_3C}/omnichannel/chats-report",
-        f"{BASE_URL_3C}/chats"
+    # Parâmetros oficiais extraídos da sua tela de rede
+    params = [
+        ("api_token", TOKEN_3C_PLUS),
+        ("page", "1"),
+        ("per_page", "100"),
+        ("start_date", f"{data_alvo} 00:00:00"),
+        ("end_date", f"{data_alvo} 23:59:59"),
+        ("group_channel_ids[]", "9801"),
+        ("group_channel_ids[]", "9797"),
+        ("group_channel_ids[]", "9683"),
+        ("group_channel_ids[]", "9682")
     ]
     
-    variacoes_params = [
-        {"api_token": TOKEN_3C_PLUS, "start_date": f"{data_alvo} 00:00:00", "end_date": f"{data_alvo} 23:59:59"},
-        {"api_token": TOKEN_3C_PLUS, "start_date": data_alvo, "end_date": data_alvo}
-    ]
-    
-    for ep in endpoints:
-        for params in variacoes_params:
-            try:
-                print(f"Tentando endpoint Omnichannel: {ep}...")
-                resp = requests.get(ep, headers=headers, params=params, timeout=30)
-                if resp.ok:
-                    dados = resp.json()
-                    itens = dados.get("data", dados) if isinstance(dados, dict) else dados
-                    if isinstance(itens, list) and len(itens) > 0:
-                        print(f"Sucesso no Omnichannel ({ep})! Total de conversas obtidas: {len(itens)}")
-                        return itens
-                    elif isinstance(itens, list):
-                        print(f"Endpoint {ep} conectado com sucesso (0 conversas registradas no dia).")
-                        return itens
-            except Exception as e:
-                pass
-            
+    print(f"Consultando conversas do WhatsApp Omnichannel para {data_alvo}...")
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=40)
+        print(f"Status Omnichannel: {resp.status_code}")
+        if resp.ok:
+            dados = resp.json()
+            itens = dados.get("data", dados) if isinstance(dados, dict) else dados
+            if isinstance(itens, list):
+                print(f"Sucesso! Total de conversas obtidas do WhatsApp: {len(itens)}")
+                return itens
+        else:
+            print(f"Aviso no Omnichannel ({resp.status_code}): {resp.text[:180]}")
+    except Exception as e:
+        print(f"Erro ao consultar Omnichannel: {e}")
+        
     return []
 
 def analisar_audio_com_gemini(audio_base64):
-    """Envia o áudio para os modelos oficiais da geração 3."""
-    modelos = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-flash-latest"]
+    """Envia o áudio para modelos oficiais do Gemini com retentativa."""
+    modelos = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-pro"]
     payload = {
         "contents": [{
             "parts": [
@@ -110,10 +108,12 @@ def analisar_audio_com_gemini(audio_base64):
             if resp.ok:
                 dados = resp.json()
                 return dados["candidates"][0]["content"]["parts"][0]["text"]
-            else:
-                print(f"Modelo {modelo} retornou status {resp.status_code}. Alternando...")
+            elif resp.status_code == 503:
+                print(f"Modelo {modelo} com pico de demanda (503). Aguardando 3s antes de alternar...")
+                time.sleep(3)
         except Exception as e:
             print(f"Aviso no modelo {modelo}: {e}")
+            time.sleep(2)
             
     return None
 
@@ -123,9 +123,7 @@ def processar_e_enviar():
     print(f"INICIANDO CONSOLIDAÇÃO DIÁRIA — DATA ALVO: {data_alvo}")
     print(f"========================================================\n")
 
-    # ----------------------------------------------------------
-    # 1. PROCESSAMENTO DE VOZ (DISCADOR)
-    # ----------------------------------------------------------
+    # 1. PROCESSAMENTO DE VOZ
     ligacoes = buscar_ligacoes_3c(data_alvo)
     chamadas_atendidas = [
         c for c in ligacoes 
@@ -187,28 +185,32 @@ def processar_e_enviar():
         print("Enviando ligação para o Google Docs...")
         requests.post(GOOGLE_DOCS_WEBHOOK_URL, json=registro_voz, timeout=30)
 
-    # ----------------------------------------------------------
-    # 2. PROCESSAMENTO DE TEXTO (OMNICHANNEL / WHATSAPP)
-    # ----------------------------------------------------------
+    # 2. PROCESSAMENTO DE WHATSAPP (OMNICHANNEL)
     print(f"\n--- Processando Relatório de Conversas Omnichannel ---")
     conversas = buscar_conversas_omnichannel(data_alvo)
     
     if conversas:
         total_wpp = len(conversas)
-        agentes_wpp = Counter(c.get("agent_name") or c.get("agent") or c.get("Agente") or "Sem Agente" for c in conversas)
-        status_wpp = Counter(c.get("status") or c.get("Status") or "Em Aberto" for c in conversas)
+        agentes_wpp = Counter(
+            c.get("agent_name") or c.get("agent") or c.get("user_name") or "Sem Agente" 
+            for c in conversas
+        )
+        status_wpp = Counter(
+            c.get("status") or c.get("readable_status") or "Em Aberto" 
+            for c in conversas
+        )
         
         detalhe_agentes = ", ".join([f"{ag}: {qtd}" for ag, qtd in agentes_wpp.items()])
         detalhe_status = ", ".join([f"{st}: {qtd}" for st, qtd in status_wpp.items()])
 
         analise_wpp = {
-            "resumo": f"Total de {total_wpp} conversas de WhatsApp registradas em {data_alvo}. Atendimentos: {detalhe_agentes}.",
-            "interesse": "Negociações comerciais no WhatsApp",
+            "resumo": f"Total de {total_wpp} conversas no WhatsApp em {data_alvo}. Distribuição por atendente: {detalhe_agentes}.",
+            "interesse": "Negociações ativas no WhatsApp",
             "objecoes": f"Status das conversas: {detalhe_status}",
-            "desempenho_atendente": "Atendimento e envio de propostas comerciais / catálogos",
+            "desempenho_atendente": "Envio de catálogos e orçamentos via WhatsApp Omni",
             "lead_quente": True,
             "nota": 9.0,
-            "justificativa_nota": "Consolidado do Omnichannel 3C Plus"
+            "justificativa_nota": "Consolidado oficial do 3C Omni"
         }
 
         registro_omni = {
@@ -216,7 +218,7 @@ def processar_e_enviar():
             "data_hora": f"{data_alvo} 18:00:00",
             "agente": "Equipe Comercial (WhatsApp Omni)",
             "numero": f"{total_wpp} conversas",
-            "qualificacao": "Consolidado WhatsApp 3C",
+            "qualificacao": "Consolidado WhatsApp",
             "analise": analise_wpp
         }
 
@@ -224,7 +226,7 @@ def processar_e_enviar():
         resp_omni = requests.post(GOOGLE_DOCS_WEBHOOK_URL, json=registro_omni, timeout=30)
         print(f"Status do WhatsApp no Google Docs: {resp_omni.status_code}")
     else:
-        print("Nenhuma conversa retornada pelos endpoints de Omnichannel.")
+        print("Nenhuma conversa de WhatsApp retornada no período.")
 
     print("\n========================================================")
     print("CONSOLIDAÇÃO DIÁRIA FINALIZADA COM SUCESSO!")
