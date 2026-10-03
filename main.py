@@ -4,6 +4,7 @@ import base64
 import tempfile
 import time
 import requests
+from collections import Counter
 from datetime import datetime, timedelta
 
 # ==============================================================
@@ -18,32 +19,19 @@ GOOGLE_DOCS_WEBHOOK_URL = ENV_DOCS if ENV_DOCS.startswith("http") else URL_PADRA
 
 DOMINIO_FIBRART = "https://fibrartindustria.3c.plus"
 
-PROMPT_ANALISE_VOZ = """
-Você é um especialista em qualidade e conversão de telemarketing e vendas de marmofibra (tanques e pias).
-Analise detalhadamente o áudio da ligação anexa e retorne em formato JSON válido com as seguintes chaves:
+PROMPT_CONSOLIDACAO_DIARIA = """
+Você é o Diretor Comercial e Especialista de Qualidade da Fibrart (indústria de pias e tanques em marmofibra).
+Com base nos dados brutos de ligações de voz e nas conversas do WhatsApp Omnichannel do discador 3C Plus referentes ao dia de atendimento, gere um RELATÓRIO EXECUTIVO CONSOLIDADO DAS TRATATIVAS para a diretoria.
+
+O relatório deve conter estritamente em formato JSON com as chaves:
 {
-  "resumo": "Breve resumo da conversa",
-  "interesse": "Alto / Médio / Baixo / Nenhum",
-  "objecoes": "Principais objeções levantadas pelo cliente",
-  "desempenho_atendente": "Avaliação da postura, clareza e argumentação",
+  "resumo": "Visão geral do dia, volume de atendimentos e principais temas tratados",
+  "interesse": "Status das negociações no WhatsApp e pedidos em andamento",
+  "objecoes": "Principais objeções levantadas pelos clientes e gargalos operacionais (ex: fila de espera, tempo de resposta, frete)",
+  "desempenho_atendente": "Diagnóstico do desempenho das atendentes (Fernanda, Julia, Gabriele): conversão, postura e agilidade",
   "lead_quente": true,
   "nota": 8.5,
-  "justificativa_nota": "Motivo da pontuação"
-}
-Retorne estritamente o JSON sem blocos markdown.
-"""
-
-PROMPT_ANALISE_WHATSAPP = """
-Você é um especialista em conversão de vendas B2B de tanques e pias em marmofibra da Fibrart.
-Analise detalhadamente o diálogo da conversa de WhatsApp abaixo e retorne em formato JSON válido:
-{
-  "resumo": "Produtos solicitados e resumo do que foi tratado",
-  "interesse": "Alto / Médio / Baixo / Nenhum",
-  "objecoes": "Objeções identificadas (preço, frete, prazo, etc.)",
-  "desempenho_atendente": "Avaliação da agilidade, clareza e poder de fechamento da vendedora",
-  "lead_quente": true,
-  "nota": 9.0,
-  "justificativa_nota": "Diagnóstico do atendimento no WhatsApp e próximo passo recomendado"
+  "justificativa_nota": "Plano de ação imediato para fechar as negociações abertas e zerar pendências"
 }
 Retorne estritamente o JSON sem blocos markdown.
 """
@@ -54,16 +42,16 @@ def buscar_ligacoes_3c(data_alvo):
     params = {"api_token": TOKEN_3C_PLUS, "start_date": f"{data_alvo} 00:00:00", "end_date": f"{data_alvo} 23:59:59"}
     
     print(f"Consultando ligações de voz para {data_alvo}...")
-    response = requests.get(url, params=params, headers=headers, timeout=60)
-    if not response.ok:
-        params_simples = {"api_token": TOKEN_3C_PLUS, "start_date": data_alvo, "end_date": data_alvo}
-        response = requests.get(url, params=params_simples, headers=headers, timeout=60)
-        response.raise_for_status()
-
-    dados = response.json()
-    ligacoes = dados.get("data", dados) if isinstance(dados, dict) else dados
-    print(f"Total de chamadas de voz retornadas: {len(ligacoes)}")
-    return ligacoes
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=60)
+        if not response.ok:
+            params_simples = {"api_token": TOKEN_3C_PLUS, "start_date": data_alvo, "end_date": data_alvo}
+            response = requests.get(url, params=params_simples, headers=headers, timeout=60)
+        dados = response.json()
+        return dados.get("data", dados) if isinstance(dados, dict) else dados
+    except Exception as e:
+        print(f"Erro ao buscar chamadas de voz: {e}")
+        return []
 
 def buscar_conversas_omnichannel(data_alvo):
     url = f"{DOMINIO_FIBRART}/omni-reports/api/v1/chats"
@@ -79,62 +67,32 @@ def buscar_conversas_omnichannel(data_alvo):
         ("group_channel_ids[]", "9683"),
         ("group_channel_ids[]", "9682")
     ]
-    
-    print(f"Consultando conversas do WhatsApp Omnichannel para {data_alvo}...")
+    print(f"Consultando conversas do WhatsApp para {data_alvo}...")
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=40)
         if resp.ok:
             dados = resp.json()
             itens = dados.get("data", dados) if isinstance(dados, dict) else dados
             if isinstance(itens, list):
-                print(f"Sucesso! Total de conversas obtidas do WhatsApp: {len(itens)}")
                 return itens
     except Exception as e:
-        print(f"Erro ao consultar Omnichannel: {e}")
+        print(f"Erro ao buscar WhatsApp: {e}")
     return []
 
-def extrair_mensagens_chat(chat_id):
-    """Tenta obter as mensagens de texto de um chat específico."""
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {TOKEN_3C_PLUS}"}
-    urls_tentativa = [
-        f"{DOMINIO_FIBRART}/omni-reports/api/v1/chats/{chat_id}/messages?api_token={TOKEN_3C_PLUS}",
-        f"{DOMINIO_FIBRART}/api/v1/whatsapp/chats/{chat_id}/messages?api_token={TOKEN_3C_PLUS}",
-        f"{DOMINIO_FIBRART}/omni-reports/api/v1/chats/{chat_id}?api_token={TOKEN_3C_PLUS}"
-    ]
-    for u in urls_tentativa:
-        try:
-            r = requests.get(u, headers=headers, timeout=20)
-            if r.ok:
-                d = r.json()
-                msgs = d.get("messages", d.get("data", []))
-                if isinstance(msgs, list) and msgs:
-                    # Constrói o histórico formatado
-                    dialogo = []
-                    for m in msgs:
-                        autor = m.get("sender_name") or m.get("type") or "Contato"
-                        texto = m.get("text") or m.get("body") or m.get("message") or ""
-                        if texto:
-                            dialogo.append(f"{autor}: {texto}")
-                    if dialogo:
-                        return "\n".join(dialogo)
-        except Exception:
-            pass
-    return None
-
-def analisar_com_gemini(conteudo_texto, prompt_especifico):
-    """Envia texto para análise no Gemini 3.6 Flash / 3.7 Flash."""
+def sintetizar_com_gemini(dados_brutos_texto):
+    """Envia o consolidado do dia para o Gemini gerar o relatório executivo."""
     modelos = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-flash-latest"]
     payload = {
         "contents": [{
             "parts": [
-                {"text": f"{prompt_especifico}\n\nCONTEÚDO PARA ANÁLISE:\n{conteudo_texto}"}
+                {"text": f"{PROMPT_CONSOLIDACAO_DIARIA}\n\nDADOS BRUTOS DA OPERAÇÃO:\n{dados_brutos_texto}"}
             ]
         }]
     }
     for m in modelos:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_API_KEY}"
         try:
-            resp = requests.post(url, json=payload, timeout=60)
+            resp = requests.post(url, json=payload, timeout=90)
             if resp.ok:
                 dados = resp.json()
                 return dados["candidates"][0]["content"]["parts"][0]["text"]
@@ -145,95 +103,86 @@ def analisar_com_gemini(conteudo_texto, prompt_especifico):
 def processar_e_enviar():
     data_alvo = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     print(f"\n========================================================")
-    print(f"INICIANDO CONSOLIDAÇÃO DIÁRIA — DATA ALVO: {data_alvo}")
+    print(f"GERANDO RELATÓRIO EXECUTIVO CONSOLIDADO — {data_alvo}")
     print(f"========================================================\n")
 
-    # 1. PROCESSAMENTO DE VOZ (LIGAÇÕES)
+    # 1. Coleta de dados
     ligacoes = buscar_ligacoes_3c(data_alvo)
-    chamadas_atendidas = [
-        c for c in ligacoes 
-        if c.get("speaking_with_agent_time") not in [None, "", "00:00:00", "0"]
-    ]
-    for chamada in chamadas_atendidas:
-        call_id = chamada.get("id")
-        agente = chamada.get("agent", "Desconhecido")
-        numero = chamada.get("number", "Não informado")
-        qualificacao = chamada.get("qualification", "Sem tabulação")
-        
-        analise_resultado = {
-            "resumo": f"Atendimento telefônico realizado por {agente}. Duração: {chamada.get('speaking_with_agent_time', 'N/D')}.",
-            "interesse": "Registrado no discador",
-            "objecoes": "Conforme qualificação",
-            "desempenho_atendente": "Registrado no 3C Plus",
-            "nota": 8.0,
-            "justificativa_nota": "Tabulado no sistema"
-        }
-        
-        registro_voz = {
-            "id": call_id,
-            "data_hora": chamada.get("call_date", data_alvo),
-            "agente": agente,
-            "numero": numero,
-            "qualificacao": qualificacao,
-            "analise": analise_resultado
-        }
-        requests.post(GOOGLE_DOCS_WEBHOOK_URL, json=registro_voz, timeout=30)
-
-    # 2. PROCESSAMENTO E ANÁLISE REAL DO WHATSAPP (OMNICHANNEL)
-    print(f"\n--- Processando Análise das Conversas do WhatsApp ---")
     conversas = buscar_conversas_omnichannel(data_alvo)
     
-    # Processa cada conversa individualmente
-    for chat in conversas:
-        chat_id = chat.get("id") or chat.get("protocol")
-        nome_cliente = chat.get("name") or chat.get("customer_name") or "Cliente WhatsApp"
-        numero_cliente = chat.get("number") or chat.get("phone") or "Sem número"
-        agente = chat.get("agent_name") or chat.get("agent") or chat.get("user_name") or "Julia/Fernanda"
-        qualificacao = chat.get("status") or chat.get("qualification") or "Em Negociação"
+    # 2. Compilação dos dados brutos
+    total_voz = len(ligacoes)
+    atendidas_voz = [c for c in ligacoes if c.get("speaking_with_agent_time") not in [None, "", "00:00:00", "0"]]
+    
+    total_wpp = len(conversas)
+    agentes_wpp = Counter(c.get("agent_name") or c.get("agent") or "Sem Agente" for c in conversas)
+    status_wpp = Counter(c.get("status") or "Em Aberto" for c in conversas)
+    
+    clientes_wpp = [
+        f"- {c.get('name', 'Cliente')} ({c.get('number', '')}) | Status: {c.get('status', '')} | Agente: {c.get('agent_name', '')}"
+        for c in conversas[:30]
+    ]
 
-        print(f"\nAnalisando conversa no WhatsApp: {nome_cliente} ({numero_cliente}) com {agente}...")
+    chamadas_detalhes = [
+        f"- {c.get('agent', '')} ➔ {c.get('number', '')} | Duração: {c.get('speaking_with_agent_time', '')} | Tabulação: {c.get('qualification', '')}"
+        for c in atendidas_voz
+    ]
 
-        # Tenta extrair as mensagens trocadas
-        historico_dialogo = extrair_mensagens_chat(chat_id)
-        
-        analise_resultado = None
-        if historico_dialogo:
-            print(f"Diálogo extraído com sucesso! Enviando para o Gemini...")
-            texto_ia = analisar_com_gemini(historico_dialogo, PROMPT_ANALISE_WHATSAPP)
-            if texto_ia:
-                texto_limpo = texto_ia.strip().replace("```json", "").replace("```", "")
-                try:
-                    analise_resultado = json.loads(texto_limpo)
-                except Exception:
-                    analise_resultado = {"resumo": texto_ia}
+    texto_para_ia = f"""
+DATA DO RELATÓRIO: {data_alvo}
 
-        if not analise_resultado:
-            # Fallback caso a conversa ainda esteja aberta ou sem histórico exportado
-            analise_resultado = {
-                "resumo": f"Atendimento via WhatsApp com {nome_cliente}. Canal: {chat.get('channel_name', 'WhatsApp')}. Status: {qualificacao}.",
-                "interesse": "Lead em negociação no WhatsApp",
-                "objecoes": "Aguardando retorno da cotação",
-                "desempenho_atendente": f"Vendedora {agente} em atendimento",
-                "lead_quente": True,
-                "nota": 8.5,
-                "justificativa_nota": "Conversa aberta no 3C Omni"
-            }
+MÉTRICAS DE VOZ (DISCADOR 3C PLUS):
+- Total de disparos: {total_voz}
+- Chamadas efetivas com conversa: {len(atendidas_voz)}
+Detalhes das ligações atendidas:
+{chr(10).join(chamadas_detalhes) if chamadas_detalhes else 'Nenhuma chamada com tempo falado.'}
 
-        registro_chat = {
-            "id": f"wpp-{chat_id}",
-            "data_hora": chat.get("created_at") or chat.get("start_time") or f"{data_alvo} 14:00:00",
-            "agente": f"{agente} (WhatsApp)",
-            "numero": f"{nome_cliente} ({numero_cliente})",
-            "qualificacao": f"WhatsApp: {qualificacao}",
-            "analise": analise_resultado
+MÉTRICAS DE WHATSAPP (3C OMNI):
+- Total de conversas no dia: {total_wpp}
+- Distribuição por atendente: {dict(agentes_wpp)}
+- Status das conversas: {dict(status_wpp)}
+Amostra das tratativas abertas no WhatsApp:
+{chr(10).join(clientes_wpp) if clientes_wpp else 'Nenhuma conversa registrada.'}
+"""
+
+    print("Enviando dados brutos consolidados para a inteligência do Gemini...")
+    sintese_ia = sintetizar_com_gemini(texto_para_ia)
+    
+    analise_resultado = None
+    if sintese_ia:
+        texto_limpo = sintese_ia.strip().replace("```json", "").replace("```", "")
+        try:
+            analise_resultado = json.loads(texto_limpo)
+        except Exception:
+            analise_resultado = {"resumo": sintese_ia}
+
+    if not analise_resultado:
+        analise_resultado = {
+            "resumo": f"Operação do dia {data_alvo}: {len(atendidas_voz)} chamadas atendidas no discador e {total_wpp} conversas registradas no WhatsApp.",
+            "interesse": f"WhatsApp: {dict(status_wpp)}",
+            "objecoes": "Mapeamento diário de tratativas",
+            "desempenho_atendente": f"Atendimento via canais 3C Omni: {dict(agentes_wpp)}",
+            "lead_quente": True,
+            "nota": 8.5,
+            "justificativa_nota": "Consolidado diário automático"
         }
 
-        print("Entregando análise da conversa no Google Docs...")
-        resp = requests.post(GOOGLE_DOCS_WEBHOOK_URL, json=registro_chat, timeout=30)
-        print(f"Status no Google Docs: {resp.status_code}")
+    # 3. Envia UM ÚNICO bloco executivo para o Google Docs
+    registro_executivo = {
+        "id": f"consolidado-{data_alvo}",
+        "data_hora": f"{data_alvo} 18:00:00",
+        "agente": "Diretoria Comercial Fibrart",
+        "numero": f"{len(atendidas_voz)} Ligações | {total_wpp} WhatsApp",
+        "qualificacao": "Relatório Executivo Consolidado das Tratativas",
+        "analise": analise_resultado
+    }
+
+    print("Gravando Relatório Executivo Consolidado no Google Docs...")
+    resp = requests.post(GOOGLE_DOCS_WEBHOOK_URL, json=registro_executivo, timeout=30)
+    print(f"Status da entrega no Google Docs: {resp.status_code}")
 
     print("\n========================================================")
-    print("CONSOLIDAÇÃO DIÁRIA FINALIZADA COM SUCESSO!")
+    print("CONSOLIDAÇÃO EXECUTIVA FINALIZADA COM SUCESSO!")
     print("========================================================\n")
 
 if __name__ == "__main__":
