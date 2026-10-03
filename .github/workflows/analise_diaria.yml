@@ -1,0 +1,32 @@
+name: Relatório Diário 3C Plus & Gemini
+
+on:
+  schedule:
+    # Roda de terça a sábado às 07:30 da manhã (horário de Brasília = 10:30 UTC)
+    - cron: '30 10 * * 2-6'
+  workflow_dispatch: # Permite que você clique em um botão para rodar na hora que quiser!
+
+jobs:
+  executar-analise:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependências
+        run: |
+          pip install -r requirements.txt
+
+      - name: Executar Consolidação e Envio ao Google Docs
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TOKEN_3C_PLUS: ${{ secrets.TOKEN_3C_PLUS }}
+          GOOGLE_DOCS_WEBHOOK_URL: ${{ secrets.GOOGLE_DOCS_WEBHOOK_URL }}
+        run: |
+          python main.py
