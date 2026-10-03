@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import tempfile
+import time
 import requests
 from datetime import datetime, timedelta
 
@@ -36,7 +37,6 @@ def buscar_ligacoes_3c(data_alvo):
         "Accept": "application/json",
         "Authorization": f"Bearer {TOKEN_3C_PLUS}"
     }
-    # Filtro com horário completo
     params = {
         "api_token": TOKEN_3C_PLUS,
         "start_date": f"{data_alvo} 00:00:00",
@@ -47,7 +47,6 @@ def buscar_ligacoes_3c(data_alvo):
     response = requests.get(url, params=params, headers=headers, timeout=60)
     
     if not response.ok:
-        # Alternativa de formato simples
         params_simples = {"api_token": TOKEN_3C_PLUS, "start_date": data_alvo, "end_date": data_alvo}
         response = requests.get(url, params=params_simples, headers=headers, timeout=60)
         response.raise_for_status()
@@ -57,14 +56,49 @@ def buscar_ligacoes_3c(data_alvo):
     print(f"Sucesso! Total de chamadas retornadas pela API da Fibrart: {len(ligacoes)}")
     return ligacoes
 
+def analisar_audio_com_gemini(audio_base64):
+    """Envia o áudio para o Gemini testando modelos estáveis com fallback automático."""
+    modelos = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.8-flash"]
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": PROMPT_ANALISE},
+                    {
+                        "inline_data": {
+                            "mime_type": "audio/mp3",
+                            "data": audio_base64
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+    
+    for modelo in modelos:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
+        print(f"Tentando análise com o modelo estável: {modelo}...")
+        try:
+            resp = requests.post(url, json=payload, timeout=90)
+            if resp.status_code == 503:
+                print(f"Modelo {modelo} com pico de demanda (503). Alternando para o próximo...")
+                time.sleep(2)
+                continue
+            resp.raise_for_status()
+            dados = resp.json()
+            return dados["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception as e:
+            print(f"Aviso no modelo {modelo}: {e}")
+            continue
+            
+    raise Exception("Todos os modelos testados retornaram indisponibilidade temporária.")
+
 def processar_e_enviar():
-    # Data de ontem (D-1)
     data_alvo = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     print(f"Iniciando consolidação do dia {data_alvo}...")
 
     ligacoes = buscar_ligacoes_3c(data_alvo)
     
-    # Filtra apenas chamadas com gravação e que tiveram tempo de conversação
     chamadas_com_audio = [
         c for c in ligacoes 
         if c.get("recording") and c.get("speaking_with_agent_time") not in [None, "", "00:00:00", "0"]
@@ -81,7 +115,7 @@ def processar_e_enviar():
         print(f"\n--- Processando Chamada {call_id} ({agente} ➔ {numero}) ---")
         
         try:
-            # 1. Ajusta o domínio do áudio para fibrartindustria.3c.plus
+            # 1. Download do áudio via subdomínio da Fibrart
             audio_url = raw_recording_url.replace("app.3c.plus", "fibrartindustria.3c.plus")
             if "api_token" not in audio_url:
                 audio_url = f"{audio_url}?api_token={TOKEN_3C_PLUS}"
@@ -93,49 +127,19 @@ def processar_e_enviar():
             
             resp_audio = requests.get(audio_url, headers=headers_audio, timeout=60)
             if resp_audio.status_code == 404:
-                print(f"Gravação {call_id} não encontrada no S3 da 3C Plus (HTTP 404). Pulando...")
+                print(f"Gravação {call_id} não encontrada na 3C Plus (HTTP 404). Pulando...")
                 continue
             resp_audio.raise_for_status()
 
-            # Converte o áudio para base64
+            # 2. Converte para base64 e analisa com o Gemini
             audio_base64 = base64.b64encode(resp_audio.content).decode("utf-8")
-
-            # 2. Envio REST com retentativa automática em caso de pico (HTTP 503)
-            print("Enviando áudio para o Gemini 3.8 Flash...")
-            gemini_payload = {
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": PROMPT_ANALISE},
-                            {
-                                "inline_data": {
-                                    "mime_type": "audio/mp3",
-                                    "data": audio_base64
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
+            texto_analise = analisar_audio_com_gemini(audio_base64)
             
-            gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
-            
-            # Tenta até 3 vezes com pausa de 3 segundos se houver pico no Google
-            max_tentativas = 3
-            resp_gemini = None
-            for tentativa in range(1, max_tentativas + 1):
-                resp_gemini = requests.post(gemini_url, json=gemini_payload, timeout=90)
-                if resp_gemini.status_code == 503 and tentativa < max_tentativas:
-                    print(f"Pico temporário no Google (503). Aguardando 3s para tentar novamente ({tentativa}/{max_tentativas})...")
-                    import time
-                    time.sleep(3)
-                    continue
-                break
-
-            resp_gemini.raise_for_status()
-            
-            dados_gemini = resp_gemini.json()
-            texto_analise = dados_gemini["candidates"][0]["content"]["parts"][0]["text"]
+            texto_limpo = texto_analise.strip().replace("```json", "").replace("```", "")
+            try:
+                analise_json = json.loads(texto_limpo)
+            except Exception:
+                analise_json = {"analise_texto": texto_analise}
 
             # 3. Pacote para entrega no Google Docs
             registro = {
@@ -147,7 +151,7 @@ def processar_e_enviar():
                 "analise": analise_json
             }
 
-            # 4. Envio direto para o Webhook do Google Docs
+            # 4. Entrega no Google Docs
             print("Entregando análise no Google Docs...")
             resp_doc = requests.post(GOOGLE_DOCS_WEBHOOK_URL, json=registro, timeout=30)
             print(f"Sucesso! Status no Google Docs: {resp_doc.status_code}")
