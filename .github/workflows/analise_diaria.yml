@@ -3,7 +3,7 @@ name: Relatório Diário 3C Plus & Gemini
 on:
   schedule:
     # Roda de terça a sábado às 07:30 da manhã (horário de Brasília = 10:30 UTC)
-    - cron: '30 10 * * 2-6'
+    - cron: '37 10 * * 2-6'
   workflow_dispatch: # Permite rodar manualmente a qualquer momento pelo botão
 
 jobs:
