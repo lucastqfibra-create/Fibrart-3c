@@ -39,19 +39,36 @@ Retorne estritamente o JSON sem blocos markdown.
 def buscar_ligacoes_3c(data_alvo):
     url = f"{DOMINIO_FIBRART}/api/v1/calls"
     headers = {"Accept": "application/json", "Authorization": f"Bearer {TOKEN_3C_PLUS}"}
-    params = {"api_token": TOKEN_3C_PLUS, "start_date": f"{data_alvo} 00:00:00", "end_date": f"{data_alvo} 23:59:59"}
+    todas_ligacoes = []
+    pagina = 1
     
-    print(f"Consultando ligações de voz para {data_alvo}...")
-    try:
-        response = requests.get(url, params=params, headers=headers, timeout=60)
-        if not response.ok:
-            params_simples = {"api_token": TOKEN_3C_PLUS, "start_date": data_alvo, "end_date": data_alvo}
-            response = requests.get(url, params=params_simples, headers=headers, timeout=60)
-        dados = response.json()
-        return dados.get("data", dados) if isinstance(dados, dict) else dados
-    except Exception as e:
-        print(f"Erro ao buscar chamadas de voz: {e}")
-        return []
+    print(f"Consultando todas as páginas de ligações para {data_alvo}...")
+    while True:
+        params = {
+            "api_token": TOKEN_3C_PLUS,
+            "start_date": f"{data_alvo} 00:00:00",
+            "end_date": f"{data_alvo} 23:59:59",
+            "page": pagina,
+            "per_page": 100
+        }
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=60)
+            if not resp.ok:
+                break
+            dados = resp.json()
+            itens = dados.get("data", dados) if isinstance(dados, dict) else dados
+            if not itens or not isinstance(itens, list):
+                break
+            todas_ligacoes.extend(itens)
+            if len(itens) < 100:  # Última página atingida
+                break
+            pagina += 1
+        except Exception as e:
+            print(f"Erro na página {pagina}: {e}")
+            break
+            
+    print(f"Total de ligações recuperadas via API: {len(todas_ligacoes)}")
+    return todas_ligacoes
 
 def buscar_conversas_omnichannel(data_alvo):
     url = f"{DOMINIO_FIBRART}/omni-reports/api/v1/chats"
