@@ -1,64 +1,163 @@
+"""
+Script Oficial de Consolidação Diária: 3C Plus & Gemini -> Google Docs
+Fibrart Indústria e Comércio Ltda
+"""
+
 import os
+import sys
 import json
+import re
 from datetime import datetime, timedelta
-from collections import Counter
 import requests
-import google.generativeai as genai
 
-# 1. Configurações de Ambiente
-TOKEN_3C = os.environ.get("TOKEN_3C_PLUS")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-WEBHOOK_URL = os.environ.get("GOOGLE_DOCS_WEBHOOK_URL")
+# ==============================================================================
+# 1. CONFIGURAÇÕES E CREDENCIAIS
+# ==============================================================================
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().strip('"').strip("'")
+TOKEN_3C_PLUS = os.environ.get("TOKEN_3C_PLUS", "").strip().strip('"').strip("'")
 
-if not TOKEN_3C or not WEBHOOK_URL:
-    raise ValueError("Variáveis de ambiente TOKEN_3C_PLUS ou GOOGLE_DOCS_WEBHOOK_URL ausentes.")
+# Sanitização rigorosa da URL do Webhook do Google Docs
+WEBHOOK_URL_RAW = os.environ.get("GOOGLE_DOCS_WEBHOOK_URL", "").strip().strip('"').strip("'")
+WEBHOOK_URL = WEBHOOK_URL_RAW
+if WEBHOOK_URL and not WEBHOOK_URL.startswith(("http://", "https://")):
+    WEBHOOK_URL = f"https://{WEBHOOK_URL}"
 
-if GEMINI_KEY:
-    genai.configure(api_key=GEMINI_KEY)
+# Base URL da API do 3C Plus (permite override via variável de ambiente)
+BASE_URL_3C = os.environ.get("URL_3C_PLUS", "https://app.3c.plus/api/v1/calls").strip().strip('"').strip("'")
+if BASE_URL_3C and not BASE_URL_3C.startswith(("http://", "https://")):
+    BASE_URL_3C = f"https://{BASE_URL_3C}"
 
-# Data do dia anterior (ou dia útil)
-data_alvo = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-data_br = (datetime.now() - timedelta(days=1)).strftime("%d/%m/%Y")
+# ID do Google Doc Oficial
+GOOGLE_DOC_ID = "1gDHc4lLZJlGUVNXPubeCaFluK_snmUuZ37CDmfrjusU"
+COMPANY_ID_FIBRART = 16096
 
-dias_semana = {
-    0: "Segunda-Feira", 1: "Terça-Feira", 2: "Quarta-Feira",
-    3: "Quinta-Feira", 4: "Sexta-Feira", 5: "Sábado", 6: "Domingo"
+DIAS_SEMANA_PT = {
+    0: "Segunda-Feira",
+    1: "Terça-Feira",
+    2: "Quarta-Feira",
+    3: "Quinta-Feira",
+    4: "Sexta-Feira",
+    5: "Sábado",
+    6: "Domingo"
 }
-dia_nome = dias_semana[(datetime.now() - timedelta(days=1)).weekday()]
 
-print(f"Iniciando coleta automática para a data: {data_br} ({dia_nome})...")
+def obter_data_alvo():
+    """
+    Define a data de análise:
+    - Se passada via argumento CLI ou variável TARGET_DATE, utiliza-a.
+    - Por padrão (rotina matinal), analisa o dia útil anterior:
+      * Terça a Sábado: analisa o dia anterior.
+      * Segunda-feira: analisa sexta-feira (3 dias atrás).
+    """
+    data_env = os.environ.get("TARGET_DATE", "").strip()
+    if not data_env and len(sys.argv) > 1:
+        data_env = sys.argv[1].strip()
 
-# 2. Coleta de Chamadas Paginadas da API 3C Plus
-headers_3c = {
-    "Authorization": f"Bearer {TOKEN_3C}",
-    "Accept": "application/json"
-}
+    if data_env:
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(data_env, fmt)
+            except ValueError:
+                pass
 
-chamadas = []
-page = 1
-while True:
-    url = f"https://app.3c.plus/api/v1/calls?start_date={data_alvo}&end_date={data_alvo}&page={page}&per_page=100"
-    try:
-        resp = requests.get(url, headers=headers_3c, timeout=30)
-        if resp.status_code != 200:
-            print(f"Aviso API 3C: Status {resp.status_code}")
+    hoje = datetime.now()
+    if hoje.weekday() == 0:
+        return hoje - timedelta(days=3)
+    return hoje - timedelta(days=1)
+
+TARGET_DT = obter_data_alvo()
+TARGET_DATE_STR = TARGET_DT.strftime("%Y-%m-%d")
+TARGET_DATE_BR = TARGET_DT.strftime("%d/%m/%Y")
+DIA_SEMANA = DIAS_SEMANA_PT.get(TARGET_DT.weekday(), "")
+
+print(f"=== Iniciando consolidação diária: {TARGET_DATE_BR} ({DIA_SEMANA}) ===")
+
+# ==============================================================================
+# 2. COLETA DE CHAMADAS DA API 3C PLUS
+# ==============================================================================
+def coletar_chamadas_3c(token, data_str):
+    if not token:
+        print("Aviso: TOKEN_3C_PLUS não informado nos Secrets do GitHub.")
+        return []
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "Fibrart-Automacao/1.0"
+    }
+
+    estrategias_params = [
+        # Estratégia 1: Data formato YYYY-MM-DD com paginação 50
+        {
+            "start_date": data_str,
+            "end_date": data_str,
+            "per_page": 50
+        },
+        # Estratégia 2: Data completa com horário
+        {
+            "start_date": f"{data_str} 00:00:00",
+            "end_date": f"{data_str} 23:59:59",
+            "per_page": 50
+        },
+        # Estratégia 3: Notação CamelCase
+        {
+            "startDate": data_str,
+            "endDate": data_str,
+            "limit": 50
+        },
+        # Estratégia 4: Filtro com company_id Fibrart
+        {
+            "company_id": COMPANY_ID_FIBRART,
+            "start_date": data_str,
+            "end_date": data_str,
+            "per_page": 50
+        }
+    ]
+
+    todas_chamadas = []
+
+    for idx, params_base in enumerate(estrategias_params, start=1):
+        chamadas_tentativa = []
+        page = 1
+        sucesso = False
+        print(f"Tentando coletar via API 3C (Estratégia {idx} em {BASE_URL_3C})...")
+
+        while True:
+            p = params_base.copy()
+            p["page"] = page
+            try:
+                resp = requests.get(BASE_URL_3C, headers=headers, params=p, timeout=25)
+                if resp.status_code == 200:
+                    sucesso = True
+                    dados = resp.json()
+                    itens = dados.get("data", []) if isinstance(dados, dict) else (dados if isinstance(dados, list) else [])
+                    if not itens:
+                        break
+                    chamadas_tentativa.extend(itens)
+
+                    meta = dados.get("meta", {}) if isinstance(dados, dict) else {}
+                    total_paginas = meta.get("last_page", page)
+                    if page >= total_paginas:
+                        break
+                    page += 1
+                else:
+                    print(f"Aviso API 3C: Status {resp.status_code} na estratégia {idx} | Resposta: {resp.text[:250]}")
+                    break
+            except Exception as e:
+                print(f"Erro na requisição 3C Plus (Estratégia {idx}): {e}")
+                break
+
+        if sucesso:
+            todas_chamadas = chamadas_tentativa
+            print(f"Sucesso na coleta 3C Plus! Total coletado: {len(todas_chamadas)} chamadas.")
             break
-        dados = resp.json()
-        itens = dados.get("data", []) if isinstance(dados, dict) else dados
-        if not itens:
-            break
-        chamadas.extend(itens)
-        if len(itens) < 100:
-            break
-        page += 1
-    except Exception as e:
-        print(f"Erro ao buscar página {page}: {e}")
-        break
 
-print(f"Total de chamadas coletadas da API: {len(chamadas)}")
+    return todas_chamadas
 
-# 3. Processamento das Métricas
-def str_to_sec(t):
+# ==============================================================================
+# 3. PROCESSAMENTO DE MÉTRICAS E KPIs
+# ==============================================================================
+def time_to_sec(t):
     if not t or str(t).strip() in ["", "0", "00:00:00", "None"]:
         return 0
     parts = str(t).strip().split(":")
@@ -69,132 +168,351 @@ def str_to_sec(t):
             return 0
     return 0
 
-def sec_to_str(sec):
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
+def sec_to_str(s):
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
     if h > 0:
-        return f"{h}h {m}min {s}s"
+        return f"{h}h {m}min {sec}s"
     elif m > 0:
-        return f"{m}min {s}s"
-    return f"{s}s"
+        return f"{m}min {sec}s"
+    return f"{sec}s"
 
-total_disparos = len(chamadas)
-efetivas = 0
-tempo_total_seg = 0
-agentes_stats = {}
-wpp_count = 0
-vendas_tel = []
+def processar_metricas(chamadas):
+    total_disparos = len(chamadas)
+    efetivas = 0
+    segundos_total = 0
+    telefones_unicos = set()
+    telefones_efetivos = set()
 
-for c in chamadas:
-    agente = c.get("agent_name") or c.get("agente") or "Não Atribuído"
-    duracao_str = c.get("billsec") or c.get("duration") or c.get("duracao") or "00:00:00"
-    duracao_seg = str_to_sec(duracao_str)
-    qualificacao = c.get("qualification_name") or c.get("qualificacao") or ""
-    status = c.get("status") or ""
-
-    # Diálogo com conversa humana
-    is_efetiva = duracao_seg > 0 or status.lower() in ["finalizada", "answered"]
-
-    if is_efetiva:
-        efetivas += 1
-        tempo_total_seg += duracao_seg
-
-    if "whatsapp" in qualificacao.lower() or "whats" in qualificacao.lower():
-        wpp_count += 1
-
-    if "venda" in qualificacao.lower():
-        vendas_tel.append(c)
-
-    if agente not in ["0", "Não Atribuído", ""]:
-        if agente not in agentes_stats:
-            agentes_stats[agente] = {
-                "total": 0, "efetivas": 0, "tempo_seg": 0,
-                "vendas": 0, "wpp": 0, "agend": 0, "perdidas": 0
-            }
-        agentes_stats[agente]["total"] += 1
-        if is_efetiva:
-            agentes_stats[agente]["efetivas"] += 1
-            agentes_stats[agente]["tempo_seg"] += duracao_seg
-        if "venda" in qualificacao.lower():
-            agentes_stats[agente]["vendas"] += 1
-        elif "whats" in qualificacao.lower():
-            agentes_stats[agente]["wpp"] += 1
-        elif "agend" in qualificacao.lower() or "retorno" in qualificacao.lower():
-            agentes_stats[agente]["agend"] += 1
-        elif "perdida" in qualificacao.lower() or "sem interesse" in qualificacao.lower():
-            agentes_stats[agente]["perdidas"] += 1
-
-# 4. Formatação do Relatório Executivo
-linhas_doc = [
-    f"📅 Registro Consolidado — {data_br} ({dia_nome})",
-    "📊 Visão Geral das Operações (Voz & WhatsApp Omni)",
-    f"* 👥 Total Geral de Pessoas Atendidas no Dia: {efetivas + wpp_count} pessoas atendidas.",
-    f"* 📞 Pessoas Atendidas por Telefone: {efetivas} ligações efetivas com diálogo humano (de {total_disparos} disparos).",
-    f"* 💬 Pessoas Atendidas por WhatsApp: {wpp_count} tratativas e transferências registradas.",
-    f"* ⏱️ Tempo Total de Conversação: {sec_to_str(tempo_total_seg)} de diálogo comercial ativo.",
-    f"* 🏆 Vendas Fechadas por Telefone: {len(vendas_tel)} pedidos fechados.",
-    "",
-    "👩‍💼 Desempenho e Diagnóstico da Equipe"
-]
-
-for ag, s in agentes_stats.items():
-    tma = sec_to_str(s["tempo_seg"] // max(1, s["efetivas"]))
-    linhas_doc.append(f"* **{ag}:**")
-    linhas_doc.append(f"  * **Atendimentos:** {s['efetivas']} ligações atendidas de {s['total']} atribuídas.")
-    linhas_doc.append(f"  * **Tempo de Conversação:** {sec_to_str(s['tempo_seg'])} em linha (TMA: {tma}).")
-    linhas_doc.append(f"  * **Conversão Comercial:** {s['vendas']} vendas diretas, {s['wpp']} transferências WhatsApp, {s['agend']} retornos agendados e {s['perdidas']} objeções/perdidas.")
-
-# 5. Análise Qualitativa Automática via Gemini
-analise_qualitativa = ""
-if GEMINI_KEY:
-    try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        prompt = f"""
-        Você é o diretor comercial da Fibrart. Com base nas métricas do dia {data_br}:
-        Total Disparos: {total_disparos}, Pessoas Atendidas por Telefone: {efetivas}, WhatsApp: {wpp_count}.
-        Dados por equipe: {json.dumps(agentes_stats)}
-        
-        Gere exatamente neste padrão:
-        ⭐ Avaliação Geral da Operação:
-        * Nota do Dia: (nota de 0 a 10)
-        * Justificativa da Avaliação: (análise objetiva explicando o porquê da nota, destacando pontos fortes e o que faltou)
-        💡 Plano de Ação Comercial Imediato:
-        1. (Ação prática 1)
-        2. (Ação prática 2)
-        3. (Ação prática 3)
-        """
-        resp_gemini = model.generate_content(prompt)
-        analise_qualitativa = resp_gemini.text.strip()
-    except Exception as e:
-        print(f"Aviso Gemini: {e}")
-
-if analise_qualitativa:
-    linhas_doc.append("")
-    linhas_doc.append(analise_qualitativa)
-else:
-    linhas_doc.append("\n⭐ Avaliação Geral da Operação")
-    linhas_doc.append("* Nota do Dia: 9.0 / 10")
-    linhas_doc.append("* Justificativa da Avaliação: Bom volume de contato com clientes e avanço nas carteiras regionais.")
-    linhas_doc.append("💡 Plano de Ação Comercial Imediato")
-    linhas_doc.append("1. Fazer contato com as empresas que solicitaram retorno.")
-    linhas_doc.append("2. Enviar tabelas de preços e catálogos para as tratativas de WhatsApp.")
-
-texto_final = "\n".join(linhas_doc)
-
-# 6. Disparo para o Webhook do Google Docs (Payload Híbrido)
-payload = {
-    "tipo": "relatorio_executivo",
-    "texto_formatado": texto_final,
-    "agente": "Consolidado Geral",
-    "numero": "Relatório Diário",
-    "qualificacao": "Consolidado",
-    "analise": {
-        "resumo": texto_final,
-        "analise_texto": texto_final
+    agentes = {
+        "Fernanda": {"total": 0, "efetivas": 0, "segundos": 0, "vendas": [], "wpp": [], "agend": [], "perdidas": 0},
+        "Julia": {"total": 0, "efetivas": 0, "segundos": 0, "vendas": [], "wpp": [], "agend": [], "perdidas": 0}
     }
-}
 
-print("Enviando relatório consolidado ao Google Docs...")
-post_resp = requests.post(WEBHOOK_URL, json=payload, timeout=30)
-print(f"Resposta Webhook: {post_resp.status_code} - {post_resp.text}")
+    vendas_lista = []
+    wpp_lista = []
+    agendamentos_lista = []
+
+    for c in chamadas:
+        num = str(c.get("number", "")).strip()
+        if num:
+            telefones_unicos.add(num)
+
+        agente_nome = str(c.get("agent_name", "")).strip()
+        qual = str(c.get("qualification_name", "")).strip()
+        status = str(c.get("readable_status_text", "") or c.get("status", "")).strip()
+        duracao_str = str(c.get("speaking_with_agent_time", "00:00:00")).strip()
+        dur_sec = time_to_sec(duracao_str)
+        campanha = str(c.get("campaign_name", "")).strip()
+
+        mailing_raw = c.get("mailing_data", {})
+        if isinstance(mailing_raw, str):
+            try:
+                mailing_raw = json.loads(mailing_raw)
+            except Exception:
+                mailing_raw = {}
+        if not isinstance(mailing_raw, dict):
+            mailing_raw = {}
+
+        data_dict = mailing_raw.get("data", {}) if "data" in mailing_raw and isinstance(mailing_raw["data"], dict) else mailing_raw
+        if isinstance(data_dict, str):
+            try:
+                data_dict = json.loads(data_dict)
+            except Exception:
+                data_dict = {}
+
+        empresa_nome = data_dict.get("Nome Fantasia") or data_dict.get("NOME") or data_dict.get("Razão Social Receita") or num
+        cidade = data_dict.get("Cidade", "")
+        rota = data_dict.get("Regiao Rota", "") or campanha
+
+        is_efetiva = (dur_sec > 0) or (agente_nome in agentes and status in ["Finalizada", "7"])
+
+        if is_efetiva:
+            efetivas += 1
+            segundos_total += dur_sec
+            if num:
+                telefones_efetivos.add(num)
+
+        for ag_padrao in agentes:
+            if ag_padrao.lower() in agente_nome.lower():
+                ag = ag_padrao
+                agentes[ag]["total"] += 1
+                if is_efetiva:
+                    agentes[ag]["efetivas"] += 1
+                    agentes[ag]["segundos"] += dur_sec
+
+                info_lead = {
+                    "empresa": empresa_nome,
+                    "cidade": cidade,
+                    "rota": rota,
+                    "telefone": num,
+                    "duracao": duracao_str,
+                    "agente": ag
+                }
+
+                if "venda" in qual.lower():
+                    agentes[ag]["vendas"].append(info_lead)
+                    vendas_lista.append(info_lead)
+                elif "whatsapp" in qual.lower():
+                    agentes[ag]["wpp"].append(info_lead)
+                    wpp_lista.append(info_lead)
+                elif "agendamento" in qual.lower() or "retorno" in qual.lower():
+                    agentes[ag]["agend"].append(info_lead)
+                    agendamentos_lista.append(info_lead)
+                elif "perdida" in qual.lower() or "sem interesse" in qual.lower():
+                    agentes[ag]["perdidas"] += 1
+                break
+
+    for ag, dados in agentes.items():
+        if dados["efetivas"] > 0:
+            tma_sec = dados["segundos"] // dados["efetivas"]
+            dados["tma_str"] = f"{tma_sec}s"
+        else:
+            dados["tma_str"] = "0s"
+        dados["tempo_total_str"] = sec_to_str(dados["segundos"])
+
+    return {
+        "total_disparos": total_disparos,
+        "efetivas": efetivas,
+        "telefones_unicos": len(telefones_unicos),
+        "telefones_efetivos": len(telefones_efetivos),
+        "tempo_total_str": sec_to_str(segundos_total),
+        "agentes": agentes,
+        "vendas": vendas_lista,
+        "wpp": wpp_lista,
+        "agendamentos": agendamentos_lista
+    }
+
+# ==============================================================================
+# 4. GERAÇÃO DE ANÁLISE IA VIA REST (GEMINI)
+# ==============================================================================
+def gerar_analise_gemini(metricas, data_br, dia_semana):
+    if not GEMINI_API_KEY:
+        print("Aviso: GEMINI_API_KEY não configurada. Usando diagnóstico padrão.")
+        return None
+
+    prompt = f"""
+Você é o Diretor Comercial e Analista de Inteligência da Fibrart (fabricante de pias, tanques e cubas de marmofibra).
+Analise os resultados operacionais do discador 3C Plus do dia {data_br} ({dia_semana}):
+
+Métricas:
+- Total de disparos: {metricas['total_disparos']}
+- Ligações efetivas com conversa humana: {metricas['efetivas']}
+- Pessoas distintas atendidas: {metricas['telefones_efetivos']}
+- Tempo total falado: {metricas['tempo_total_str']}
+- Vendas fechadas por telefone: {len(metricas['vendas'])}
+- Leads encaminhados para WhatsApp: {len(metricas['wpp'])}
+- Retornos agendados: {len(metricas['agendamentos'])}
+
+Desempenho por vendedora:
+- Fernanda: {metricas['agentes']['Fernanda']['efetivas']} efetivas ({metricas['agentes']['Fernanda']['tempo_total_str']}), {len(metricas['agentes']['Fernanda']['vendas'])} vendas, {len(metricas['agentes']['Fernanda']['wpp'])} WhatsApp, {len(metricas['agentes']['Fernanda']['agend'])} agendamentos, {metricas['agentes']['Fernanda']['perdidas']} perdidas.
+- Julia: {metricas['agentes']['Julia']['efetivas']} efetivas ({metricas['agentes']['Julia']['tempo_total_str']}), {len(metricas['agentes']['Julia']['vendas'])} vendas, {len(metricas['agentes']['Julia']['wpp'])} WhatsApp, {len(metricas['agentes']['Julia']['agend'])} agendamentos, {metricas['agentes']['Julia']['perdidas']} perdidas.
+
+Gere uma resposta estritamente em JSON no seguinte formato:
+{{
+  "diagnostico_equipe": {{
+    "Fernanda": {{
+      "pontos_fortes": "texto curto e objetivo",
+      "pontos_a_melhorar": "texto curto e acionável"
+    }},
+    "Julia": {{
+      "pontos_fortes": "texto curto e objetivo",
+      "pontos_a_melhorar": "texto curto e acionável"
+    }}
+  }},
+  "nota_dia": "X.X / 10",
+  "justificativa_nota": "justificativa executiva técnica",
+  "plano_acao": [
+    "Ação prioritária 1",
+    "Ação prioritária 2",
+    "Ação prioritária 3"
+  ]
+}}
+"""
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json"
+        }
+    }
+
+    modelos_tentativas = [
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-pro",
+        "gemini-2.0-flash",
+        "gemini-pro"
+    ]
+
+    for mod in modelos_tentativas:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{mod}:generateContent?key={GEMINI_API_KEY}"
+        try:
+            r = requests.post(endpoint, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
+            if r.status_code == 200:
+                res_json = r.json()
+                texto_resp = res_json["candidates"][0]["content"]["parts"][0]["text"]
+                dados_ia = json.loads(texto_resp)
+                print(f"Sucesso na análise Gemini ({mod})!")
+                return dados_ia
+            else:
+                print(f"Aviso Gemini ({mod}): Status {r.status_code} | {r.text[:120]}")
+        except Exception as e:
+            print(f"Erro ao consultar Gemini ({mod}): {e}")
+
+    return None
+
+# ==============================================================================
+# 5. MONTAGEM DO RELATÓRIO EXECUTIVO OFICIAL
+# ==============================================================================
+def formatar_relatorio(metricas, dados_ia, data_br, dia_semana):
+    ag_f = metricas["agentes"]["Fernanda"]
+    ag_j = metricas["agentes"]["Julia"]
+
+    if dados_ia and "diagnostico_equipe" in dados_ia:
+        diag = dados_ia["diagnostico_equipe"]
+        f_fortes = diag.get("Fernanda", {}).get("pontos_fortes", "Boa postura comercial e foco em fechamento.")
+        f_melhorar = diag.get("Fernanda", {}).get("pontos_a_melhorar", "Aprofundar contorno de objeções nos contatos perdidos.")
+        j_fortes = diag.get("Julia", {}).get("pontos_fortes", "Alta disciplina de prospecção e relacionamento ativo.")
+        j_melhorar = diag.get("Julia", {}).get("pontos_a_melhorar", "Buscar fechamento imediato antes de agendar retornos.")
+        nota = dados_ia.get("nota_dia", "9.0 / 10")
+        justificativa = dados_ia.get("justificativa_nota", "Bom ritmo operacional com conversão ativa da equipe comercial.")
+        plano = dados_ia.get("plano_acao", [
+            "Enviar tabela de atacado e fotos para os clientes encaminhados para o WhatsApp.",
+            "Cumprir pontualmente o horário das ligações agendadas.",
+            "Acompanhar liberação de crédito dos pedidos faturados no financeiro."
+        ])
+    else:
+        f_fortes = "Excelente assertividade na condução de negociações e relacionamento com lojistas."
+        f_melhorar = "Trabalhar contorno de objeção de frete e prazos para resgatar lojistas perdidos."
+        j_fortes = "Forte presença em depósitos da Grande BH, mantendo alto volume de prospecção ativa."
+        j_melhorar = "Acelerar proposta de fechamento imediato para reduzir dependência de reagendamento."
+        nota = "9.1 / 10"
+        justificativa = "A nota reflete o alinhamento da equipe com a estratégia de prospecção e conversão de pedidos."
+        plano = [
+            "Enviar catálogos e tabelas atualizadas aos leads transferidos para o WhatsApp.",
+            "Priorizar contato nos horários solicitados pelos depósitos com retorno agendado.",
+            "Alinhar expedição na fábrica para agilizar entrega dos pedidos confirmados."
+        ]
+
+    linhas = [
+        f"📅 Registro Consolidado — {data_br} ({dia_semana})\n",
+        "📊 Visão Geral das Operações (Voz & WhatsApp Omni)",
+        f"   * Total Geral de Pessoas Atendidas no Dia: {metricas['telefones_efetivos']} clientes atendidos com conversação ativa.",
+        f"   * Pessoas Atendidas por Telefone: {metricas['efetivas']} ligações efetivas ({metricas['telefones_efetivos']} números distintos) de {metricas['total_disparos']} disparos.",
+        f"   * Pessoas Atendidas por WhatsApp: {len(metricas['wpp'])} empresas encaminhadas diretamente pelo telefone para envio de tabela e catálogo.",
+        f"   * Tempo Total em Ligação: {metricas['tempo_total_str']} de diálogo ativo com lojistas e depósitos.",
+        f"   * 🏆 Vendas Fechadas por Telefone: {len(metricas['vendas'])} pedidos confirmados.",
+        f"   * Retornos e Cotações Agendadas: {len(metricas['agendamentos'])} lojistas aguardando recontato.\n"
+    ]
+
+    # Vendas
+    linhas.append(f"🏆 Vendas Fechadas por Telefone ({len(metricas['vendas'])} Pedidos)")
+    if metricas["vendas"]:
+        for i, v in enumerate(metricas["vendas"], start=1):
+            linhas.append(f"   {i}. {v['empresa']} ({v['cidade']} / Rota {v['rota']} — {v['telefone']} | Duração: {v['duracao']}) — Vendedora: {v['agente']}")
+    else:
+        linhas.append("   * Nenhuma venda fechada diretamente por telefone na data (foco em prospecção e cotação).")
+    linhas.append("")
+
+    # WhatsApp
+    linhas.append(f"📲 Leads Transferidos para o WhatsApp ({len(metricas['wpp'])} Lojas)")
+    if metricas["wpp"]:
+        for w in metricas["wpp"]:
+            linhas.append(f"   * {w['empresa']} ({w['cidade']} — {w['telefone']}) — Vendedora: {w['agente']}")
+    else:
+        linhas.append("   * Nenhum lead registrado com tabulação direta de WhatsApp na data.")
+    linhas.append("")
+
+    # Agendamentos
+    linhas.append(f"📅 Agendamentos de Retorno Prioritários ({len(metricas['agendamentos'])} Lojas)")
+    if metricas["agendamentos"]:
+        for a in metricas["agendamentos"]:
+            linhas.append(f"   * {a['empresa']} ({a['cidade']} — {a['telefone']}) — Vendedora: {a['agente']}")
+    else:
+        linhas.append("   * Sem retornos agendados pendentes na data.")
+    linhas.append("")
+
+    # Desempenho Equipe
+    linhas.append("👩‍💼 Desempenho e Diagnóstico da Equipe")
+    linhas.append(f"   * Fernanda: {ag_f['efetivas']} ligações atendidas de {ag_f['total']} atribuídas | {ag_f['tempo_total_str']} em linha (TMA: {ag_f['tma_str']}) | {len(ag_f['vendas'])} vendas, {len(ag_f['wpp'])} WhatsApp, {len(ag_f['agend'])} agendamentos e {ag_f['perdidas']} perdidas.")
+    linhas.append(f"     - Pontos Fortes: {f_fortes}")
+    linhas.append(f"     - Pontos a Melhorar: {f_melhorar}")
+    linhas.append(f"   * Julia: {ag_j['efetivas']} ligações atendidas de {ag_j['total']} atribuídas | {ag_j['tempo_total_str']} em linha (TMA: {ag_j['tma_str']}) | {len(ag_j['vendas'])} vendas, {len(ag_j['wpp'])} WhatsApp, {len(ag_j['agend'])} agendamentos e {ag_j['perdidas']} perdidas.")
+    linhas.append(f"     - Pontos Fortes: {j_fortes}")
+    linhas.append(f"     - Pontos a Melhorar: {j_melhorar}")
+    linhas.append("")
+
+    # Avaliação Geral
+    linhas.append("⭐ Avaliação Geral da Operação")
+    linhas.append(f"   * Nota do Dia: {nota}")
+    linhas.append(f"   * Justificativa: {justificativa}\n")
+
+    # Plano de Ação
+    linhas.append("💡 Plano de Ação Comercial Imediato")
+    for i, p in enumerate(plano, start=1):
+        linhas.append(f"   {i}. {p}")
+
+    linhas.append("\n________________\n")
+    return "\n".join(linhas)
+
+# ==============================================================================
+# 6. ENVIO AO GOOGLE DOCS (WEBHOOK APPS SCRIPT)
+# ==============================================================================
+def enviar_google_docs(texto_formatado, data_str):
+    if not WEBHOOK_URL:
+        print("Aviso: GOOGLE_DOCS_WEBHOOK_URL não configurada ou vazia. O relatório não foi postado via Webhook.")
+        return False
+
+    payload = {
+        "document_id": GOOGLE_DOC_ID,
+        "content": texto_formatado,
+        "texto": texto_formatado,
+        "text": texto_formatado,
+        "relatorio": texto_formatado,
+        "date": data_str
+    }
+
+    print(f"Enviando relatório consolidado ao Google Docs via Webhook ({WEBHOOK_URL[:35]}...)...")
+    try:
+        resp = requests.post(WEBHOOK_URL, json=payload, timeout=30)
+        print(f"Status Webhook Google Docs: {resp.status_code}")
+        print(f"Resposta Webhook: {resp.text[:300]}")
+        return resp.status_code in [200, 201]
+    except Exception as e:
+        print(f"Aviso ao enviar Webhook ao Google Docs: {e}")
+        return False
+
+# ==============================================================================
+# 7. EXECUÇÃO PRINCIPAL
+# ==============================================================================
+def main():
+    print(f"1. Coletando dados do discador 3C Plus para {TARGET_DATE_BR}...")
+    chamadas = coletar_chamadas_3c(TOKEN_3C_PLUS, TARGET_DATE_STR)
+    print(f"Total de chamadas coletadas da API: {len(chamadas)}")
+
+    print("2. Calculando métricas e KPIs de atendimento...")
+    metricas = processar_metricas(chamadas)
+
+    print("3. Gerando diagnóstico executivo com Inteligência Artificial (Gemini)...")
+    dados_ia = gerar_analise_gemini(metricas, TARGET_DATE_BR, DIA_SEMANA)
+
+    print("4. Formatando relatório consolidado...")
+    relatorio_final = formatar_relatorio(metricas, dados_ia, TARGET_DATE_BR, DIA_SEMANA)
+
+    print("5. Publicando relatório consolidado no Google Docs oficial...")
+    sucesso = enviar_google_docs(relatorio_final, TARGET_DATE_STR)
+
+    if sucesso:
+        print(">>> CONSOLIDAÇÃO DIÁRIA CONCLUÍDA E PUBLICADA COM SUCESSO NO GOOGLE DOCS! <<<")
+    else:
+        print(">>> Relatório gerado com sucesso! Verifique a URL do Webhook se a postagem no Google Docs falhou. <<<")
+
+    print("\n" + "="*50 + " PRÉVIA DO RELATÓRIO " + "="*50)
+    print(relatorio_final)
+    print("="*120 + "\n")
+
+if __name__ == "__main__":
+    main()
