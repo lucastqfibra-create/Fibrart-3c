@@ -6,21 +6,25 @@ on:
   workflow_dispatch:
 
 jobs:
-  executar:
+  executar-analise:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Configurar Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Instalar requests
-        run: pip install requests
+      - name: Instalar dependências
+        run: |
+          pip install requests google-generativeai
 
-      - name: Executar consolidacao
+      - name: Executar Consolidação e Envio ao Google Docs
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TOKEN_3C_PLUS: ${{ secrets.TOKEN_3C_PLUS }}
           GOOGLE_DOCS_WEBHOOK_URL: ${{ secrets.GOOGLE_DOCS_WEBHOOK_URL }}
-        run: python main.py
+        run: |
+          python main.py
