@@ -1,7 +1,6 @@
 import os
 import json
 import requests
-from collections import Counter
 from datetime import datetime, timedelta
 
 # ==============================================================
@@ -122,7 +121,7 @@ Com base nas métricas apuradas abaixo (quantitativo exato de pessoas atendidas 
     }}
   }},
   "nota_dia": "X.X / 10",
-  "justificativa_nota": "Explicar em detalhes o que elevou a nota (acertos e conversões) e exatamente quais gargalos ou falhas descontaram pontos.",
+  "justificativa_nota": "Explicar em detalhes o que elevou a nota e exatamente quais gargalos ou falhas descontaram pontos.",
   "plano_acao": [
     "Ação tática prioritária 1",
     "Ação tática prioritária 2",
