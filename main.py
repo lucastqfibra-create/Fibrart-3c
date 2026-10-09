@@ -16,18 +16,28 @@ import requests
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().strip('"').strip("'")
 TOKEN_3C_PLUS = os.environ.get("TOKEN_3C_PLUS", "").strip().strip('"').strip("'")
 
-# Sanitização rigorosa da URL do Webhook do Google Docs
-WEBHOOK_URL_RAW = os.environ.get("GOOGLE_DOCS_WEBHOOK_URL", "").strip().strip('"').strip("'")
-WEBHOOK_URL = WEBHOOK_URL_RAW
-if WEBHOOK_URL and not WEBHOOK_URL.startswith(("http://", "https://")):
-    WEBHOOK_URL = f"https://{WEBHOOK_URL}"
+def limpar_url_webhook(raw):
+    """
+    Extrai a URL limpa mesmo se gravada no GitHub com colchetes [https://...],
+    aspas ou espaços acidentais.
+    """
+    if not raw:
+        return ""
+    m = re.search(r"https?://[^\s\)\]\"\'<>]+", raw)
+    if m:
+        return m.group(0)
+    limpo = raw.strip().strip("[]()\"' ").strip()
+    if limpo and not limpo.startswith(("http://", "https://")):
+        return f"https://{limpo}"
+    return limpo
 
-# Base URL da API do 3C Plus (permite override via variável de ambiente)
+WEBHOOK_URL_RAW = os.environ.get("GOOGLE_DOCS_WEBHOOK_URL", "")
+WEBHOOK_URL = limpar_url_webhook(WEBHOOK_URL_RAW)
+
 BASE_URL_3C = os.environ.get("URL_3C_PLUS", "https://app.3c.plus/api/v1/calls").strip().strip('"').strip("'")
 if BASE_URL_3C and not BASE_URL_3C.startswith(("http://", "https://")):
     BASE_URL_3C = f"https://{BASE_URL_3C}"
 
-# ID do Google Doc Oficial
 GOOGLE_DOC_ID = "1gDHc4lLZJlGUVNXPubeCaFluK_snmUuZ37CDmfrjusU"
 COMPANY_ID_FIBRART = 16096
 
@@ -42,13 +52,6 @@ DIAS_SEMANA_PT = {
 }
 
 def obter_data_alvo():
-    """
-    Define a data de análise:
-    - Se passada via argumento CLI ou variável TARGET_DATE, utiliza-a.
-    - Por padrão (rotina matinal), analisa o dia útil anterior:
-      * Terça a Sábado: analisa o dia anterior.
-      * Segunda-feira: analisa sexta-feira (3 dias atrás).
-    """
     data_env = os.environ.get("TARGET_DATE", "").strip()
     if not data_env and len(sys.argv) > 1:
         data_env = sys.argv[1].strip()
@@ -86,31 +89,23 @@ def coletar_chamadas_3c(token, data_str):
         "User-Agent": "Fibrart-Automacao/1.0"
     }
 
+    # Padrão confirmado da API 3C Plus com horário completo
     estrategias_params = [
-        # Estratégia 1: Data formato YYYY-MM-DD com paginação 50
-        {
-            "start_date": data_str,
-            "end_date": data_str,
-            "per_page": 50
-        },
-        # Estratégia 2: Data completa com horário
         {
             "start_date": f"{data_str} 00:00:00",
             "end_date": f"{data_str} 23:59:59",
             "per_page": 50
         },
-        # Estratégia 3: Notação CamelCase
-        {
-            "startDate": data_str,
-            "endDate": data_str,
-            "limit": 50
-        },
-        # Estratégia 4: Filtro com company_id Fibrart
         {
             "company_id": COMPANY_ID_FIBRART,
-            "start_date": data_str,
-            "end_date": data_str,
+            "start_date": f"{data_str} 00:00:00",
+            "end_date": f"{data_str} 23:59:59",
             "per_page": 50
+        },
+        {
+            "startDate": f"{data_str} 00:00:00",
+            "endDate": f"{data_str} 23:59:59",
+            "limit": 50
         }
     ]
 
@@ -133,12 +128,28 @@ def coletar_chamadas_3c(token, data_str):
                     itens = dados.get("data", []) if isinstance(dados, dict) else (dados if isinstance(dados, list) else [])
                     if not itens:
                         break
+
                     chamadas_tentativa.extend(itens)
 
-                    meta = dados.get("meta", {}) if isinstance(dados, dict) else {}
-                    total_paginas = meta.get("last_page", page)
-                    if page >= total_paginas:
+                    # Paginação dinâmica
+                    last_page = None
+                    if isinstance(dados, dict):
+                        if "last_page" in dados:
+                            last_page = dados.get("last_page")
+                        elif "meta" in dados and isinstance(dados["meta"], dict):
+                            last_page = dados["meta"].get("last_page")
+
+                    next_url = dados.get("next_page_url") if isinstance(dados, dict) else None
+
+                    if last_page is not None:
+                        if page >= int(last_page):
+                            break
+                    elif next_url is not None:
+                        if not next_url:
+                            break
+                    elif len(itens) < p.get("per_page", 50) and len(itens) < p.get("limit", 50):
                         break
+
                     page += 1
                 else:
                     print(f"Aviso API 3C: Status {resp.status_code} na estratégia {idx} | Resposta: {resp.text[:250]}")
@@ -147,9 +158,9 @@ def coletar_chamadas_3c(token, data_str):
                 print(f"Erro na requisição 3C Plus (Estratégia {idx}): {e}")
                 break
 
-        if sucesso:
+        if sucesso and chamadas_tentativa:
             todas_chamadas = chamadas_tentativa
-            print(f"Sucesso na coleta 3C Plus! Total coletado: {len(todas_chamadas)} chamadas.")
+            print(f"Sucesso na coleta 3C Plus! Total coletado: {len(todas_chamadas)} chamadas em {page} página(s).")
             break
 
     return todas_chamadas
@@ -158,12 +169,24 @@ def coletar_chamadas_3c(token, data_str):
 # 3. PROCESSAMENTO DE MÉTRICAS E KPIs
 # ==============================================================================
 def time_to_sec(t):
-    if not t or str(t).strip() in ["", "0", "00:00:00", "None"]:
+    if t is None:
         return 0
-    parts = str(t).strip().split(":")
+    if isinstance(t, (int, float)):
+        return int(t)
+    s = str(t).strip()
+    if not s or s in ["0", "00:00:00", "None"]:
+        return 0
+    if s.isdigit():
+        return int(s)
+    parts = s.split(":")
     if len(parts) == 3:
         try:
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        except ValueError:
+            return 0
+    elif len(parts) == 2:
+        try:
+            return int(parts[0]) * 60 + int(parts[1])
         except ValueError:
             return 0
     return 0
@@ -177,6 +200,12 @@ def sec_to_str(s):
     elif m > 0:
         return f"{m}min {sec}s"
     return f"{sec}s"
+
+def extrair_campo(c, chaves, padrao=""):
+    for k in chaves:
+        if k in c and c[k] is not None and str(c[k]).strip() != "":
+            return c[k]
+    return padrao
 
 def processar_metricas(chamadas):
     total_disparos = len(chamadas)
@@ -195,16 +224,42 @@ def processar_metricas(chamadas):
     agendamentos_lista = []
 
     for c in chamadas:
-        num = str(c.get("number", "")).strip()
+        num = str(extrair_campo(c, ["number", "phone", "telefone", "destinatario", "destination"])).strip()
         if num:
             telefones_unicos.add(num)
 
-        agente_nome = str(c.get("agent_name", "")).strip()
-        qual = str(c.get("qualification_name", "")).strip()
-        status = str(c.get("readable_status_text", "") or c.get("status", "")).strip()
-        duracao_str = str(c.get("speaking_with_agent_time", "00:00:00")).strip()
-        dur_sec = time_to_sec(duracao_str)
-        campanha = str(c.get("campaign_name", "")).strip()
+        # Extração flexível de agente (direto ou aninhado)
+        agente_nome = ""
+        if "agent_name" in c and c["agent_name"]:
+            agente_nome = str(c["agent_name"]).strip()
+        elif "agent" in c and isinstance(c["agent"], dict):
+            agente_nome = str(c["agent"].get("name", "")).strip()
+        elif "agent" in c and isinstance(c["agent"], str):
+            agente_nome = c["agent"].strip()
+        elif "user" in c and isinstance(c["user"], dict):
+            agente_nome = str(c["user"].get("name", "")).strip()
+
+        # Extração de qualificação
+        qual = ""
+        if "qualification_name" in c and c["qualification_name"]:
+            qual = str(c["qualification_name"]).strip()
+        elif "qualification" in c and isinstance(c["qualification"], dict):
+            qual = str(c["qualification"].get("name", "")).strip()
+        elif "qualification" in c and isinstance(c["qualification"], str):
+            qual = c["qualification"].strip()
+
+        status = str(extrair_campo(c, ["readable_status_text", "status_text", "status", "call_status"])).strip()
+
+        # Duração (trata tanto segundos inteiros quanto formato HH:MM:SS)
+        dur_raw = extrair_campo(c, ["speaking_with_agent_time", "talk_time", "duration", "billsec", "speaking_time"], 0)
+        dur_sec = time_to_sec(dur_raw)
+        duracao_str = sec_to_str(dur_sec) if dur_sec > 0 else (str(dur_raw) if str(dur_raw) != "0" else "00:00:00")
+
+        campanha = ""
+        if "campaign_name" in c and c["campaign_name"]:
+            campanha = str(c["campaign_name"]).strip()
+        elif "campaign" in c and isinstance(c["campaign"], dict):
+            campanha = str(c["campaign"].get("name", "")).strip()
 
         mailing_raw = c.get("mailing_data", {})
         if isinstance(mailing_raw, str):
@@ -226,7 +281,7 @@ def processar_metricas(chamadas):
         cidade = data_dict.get("Cidade", "")
         rota = data_dict.get("Regiao Rota", "") or campanha
 
-        is_efetiva = (dur_sec > 0) or (agente_nome in agentes and status in ["Finalizada", "7"])
+        is_efetiva = (dur_sec > 0) or (agente_nome and status.lower() in ["finalizada", "7", "completed", "answered", "atendida"])
 
         if is_efetiva:
             efetivas += 1
@@ -251,16 +306,17 @@ def processar_metricas(chamadas):
                     "agente": ag
                 }
 
-                if "venda" in qual.lower():
+                qual_lower = qual.lower()
+                if "venda" in qual_lower:
                     agentes[ag]["vendas"].append(info_lead)
                     vendas_lista.append(info_lead)
-                elif "whatsapp" in qual.lower():
+                elif "whatsapp" in qual_lower:
                     agentes[ag]["wpp"].append(info_lead)
                     wpp_lista.append(info_lead)
-                elif "agendamento" in qual.lower() or "retorno" in qual.lower():
+                elif "agendamento" in qual_lower or "retorno" in qual_lower:
                     agentes[ag]["agend"].append(info_lead)
                     agendamentos_lista.append(info_lead)
-                elif "perdida" in qual.lower() or "sem interesse" in qual.lower():
+                elif "perdida" in qual_lower or "sem interesse" in qual_lower:
                     agentes[ag]["perdidas"] += 1
                 break
 
@@ -285,12 +341,50 @@ def processar_metricas(chamadas):
     }
 
 # ==============================================================================
-# 4. GERAÇÃO DE ANÁLISE IA VIA REST (GEMINI)
+# 4. GERAÇÃO DE ANÁLISE IA VIA REST (GEMINI) COM DESCOBERTA DINÂMICA
 # ==============================================================================
+def obter_modelo_gemini_ativo(api_key):
+    """
+    Descobre os modelos ativos no Google AI Studio que suportam generateContent.
+    """
+    for api_version in ["v1beta", "v1"]:
+        try:
+            url_list = f"https://generativelanguage.googleapis.com/{api_version}/models?key={api_key}"
+            resp = requests.get(url_list, timeout=12)
+            if resp.status_code == 200:
+                dados = resp.json()
+                modelos = dados.get("models", [])
+                candidatos = []
+                for m in modelos:
+                    metodos = m.get("supportedGenerationMethods", [])
+                    nome = m.get("name", "")
+                    if "generateContent" in metodos and nome:
+                        candidatos.append((api_version, nome))
+
+                for v, n in candidatos:
+                    if "flash" in n.lower() and "exp" not in n.lower() and "preview" not in n.lower():
+                        return v, n
+                for v, n in candidatos:
+                    if "flash" in n.lower():
+                        return v, n
+                if candidatos:
+                    return candidatos[0]
+        except Exception as e:
+            print(f"Aviso ao consultar modelos Gemini ({api_version}): {e}")
+
+    return "v1beta", "models/gemini-1.5-flash"
+
 def gerar_analise_gemini(metricas, data_br, dia_semana):
     if not GEMINI_API_KEY:
         print("Aviso: GEMINI_API_KEY não configurada. Usando diagnóstico padrão.")
         return None
+
+    api_version, model_name = obter_modelo_gemini_ativo(GEMINI_API_KEY)
+    if not model_name.startswith("models/"):
+        model_name = f"models/{model_name}"
+
+    endpoint = f"https://generativelanguage.googleapis.com/{api_version}/{model_name}:generateContent?key={GEMINI_API_KEY}"
+    print(f"Consultando IA Gemini ({model_name} via {api_version})...")
 
     prompt = f"""
 Você é o Diretor Comercial e Analista de Inteligência da Fibrart (fabricante de pias, tanques e cubas de marmofibra).
@@ -339,28 +433,18 @@ Gere uma resposta estritamente em JSON no seguinte formato:
         }
     }
 
-    modelos_tentativas = [
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-pro",
-        "gemini-2.0-flash",
-        "gemini-pro"
-    ]
-
-    for mod in modelos_tentativas:
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{mod}:generateContent?key={GEMINI_API_KEY}"
-        try:
-            r = requests.post(endpoint, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
-            if r.status_code == 200:
-                res_json = r.json()
-                texto_resp = res_json["candidates"][0]["content"]["parts"][0]["text"]
-                dados_ia = json.loads(texto_resp)
-                print(f"Sucesso na análise Gemini ({mod})!")
-                return dados_ia
-            else:
-                print(f"Aviso Gemini ({mod}): Status {r.status_code} | {r.text[:120]}")
-        except Exception as e:
-            print(f"Erro ao consultar Gemini ({mod}): {e}")
+    try:
+        r = requests.post(endpoint, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
+        if r.status_code == 200:
+            res_json = r.json()
+            texto_resp = res_json["candidates"][0]["content"]["parts"][0]["text"]
+            dados_ia = json.loads(texto_resp)
+            print(f"Sucesso na análise Gemini!")
+            return dados_ia
+        else:
+            print(f"Aviso Gemini: Status {r.status_code} | {r.text[:150]}")
+    except Exception as e:
+        print(f"Erro ao consultar Gemini: {e}")
 
     return None
 
@@ -408,7 +492,6 @@ def formatar_relatorio(metricas, dados_ia, data_br, dia_semana):
         f"   * Retornos e Cotações Agendadas: {len(metricas['agendamentos'])} lojistas aguardando recontato.\n"
     ]
 
-    # Vendas
     linhas.append(f"🏆 Vendas Fechadas por Telefone ({len(metricas['vendas'])} Pedidos)")
     if metricas["vendas"]:
         for i, v in enumerate(metricas["vendas"], start=1):
@@ -417,7 +500,6 @@ def formatar_relatorio(metricas, dados_ia, data_br, dia_semana):
         linhas.append("   * Nenhuma venda fechada diretamente por telefone na data (foco em prospecção e cotação).")
     linhas.append("")
 
-    # WhatsApp
     linhas.append(f"📲 Leads Transferidos para o WhatsApp ({len(metricas['wpp'])} Lojas)")
     if metricas["wpp"]:
         for w in metricas["wpp"]:
@@ -426,7 +508,6 @@ def formatar_relatorio(metricas, dados_ia, data_br, dia_semana):
         linhas.append("   * Nenhum lead registrado com tabulação direta de WhatsApp na data.")
     linhas.append("")
 
-    # Agendamentos
     linhas.append(f"📅 Agendamentos de Retorno Prioritários ({len(metricas['agendamentos'])} Lojas)")
     if metricas["agendamentos"]:
         for a in metricas["agendamentos"]:
@@ -435,7 +516,6 @@ def formatar_relatorio(metricas, dados_ia, data_br, dia_semana):
         linhas.append("   * Sem retornos agendados pendentes na data.")
     linhas.append("")
 
-    # Desempenho Equipe
     linhas.append("👩‍💼 Desempenho e Diagnóstico da Equipe")
     linhas.append(f"   * Fernanda: {ag_f['efetivas']} ligações atendidas de {ag_f['total']} atribuídas | {ag_f['tempo_total_str']} em linha (TMA: {ag_f['tma_str']}) | {len(ag_f['vendas'])} vendas, {len(ag_f['wpp'])} WhatsApp, {len(ag_f['agend'])} agendamentos e {ag_f['perdidas']} perdidas.")
     linhas.append(f"     - Pontos Fortes: {f_fortes}")
@@ -445,12 +525,10 @@ def formatar_relatorio(metricas, dados_ia, data_br, dia_semana):
     linhas.append(f"     - Pontos a Melhorar: {j_melhorar}")
     linhas.append("")
 
-    # Avaliação Geral
     linhas.append("⭐ Avaliação Geral da Operação")
     linhas.append(f"   * Nota do Dia: {nota}")
     linhas.append(f"   * Justificativa: {justificativa}\n")
 
-    # Plano de Ação
     linhas.append("💡 Plano de Ação Comercial Imediato")
     for i, p in enumerate(plano, start=1):
         linhas.append(f"   {i}. {p}")
@@ -475,7 +553,7 @@ def enviar_google_docs(texto_formatado, data_str):
         "date": data_str
     }
 
-    print(f"Enviando relatório consolidado ao Google Docs via Webhook ({WEBHOOK_URL[:35]}...)...")
+    print(f"Enviando relatório consolidado ao Google Docs via Webhook ({WEBHOOK_URL[:45]}...)...")
     try:
         resp = requests.post(WEBHOOK_URL, json=payload, timeout=30)
         print(f"Status Webhook Google Docs: {resp.status_code}")
