@@ -345,32 +345,29 @@ def processar_metricas(chamadas):
 # ==============================================================================
 def obter_modelo_gemini_ativo(api_key):
     """
-    Descobre os modelos ativos no Google AI Studio que suportam generateContent.
+    Identifica o modelo estável e ativo no Google AI Studio.
     """
+    modelos_prioritarios = [
+        "models/gemini-1.5-flash",
+        "models/gemini-1.5-flash-latest",
+        "models/gemini-1.5-pro",
+        "models/gemini-pro"
+    ]
+    
     for api_version in ["v1beta", "v1"]:
         try:
             url_list = f"https://generativelanguage.googleapis.com/{api_version}/models?key={api_key}"
-            resp = requests.get(url_list, timeout=12)
+            resp = requests.get(url_list, timeout=10)
             if resp.status_code == 200:
                 dados = resp.json()
-                modelos = dados.get("models", [])
-                candidatos = []
-                for m in modelos:
-                    metodos = m.get("supportedGenerationMethods", [])
-                    nome = m.get("name", "")
-                    if "generateContent" in metodos and nome:
-                        candidatos.append((api_version, nome))
-
-                for v, n in candidatos:
-                    if "flash" in n.lower() and "exp" not in n.lower() and "preview" not in n.lower():
-                        return v, n
-                for v, n in candidatos:
-                    if "flash" in n.lower():
-                        return v, n
-                if candidatos:
-                    return candidatos[0]
-        except Exception as e:
-            print(f"Aviso ao consultar modelos Gemini ({api_version}): {e}")
+                disponiveis = [m.get("name") for m in dados.get("models", []) if "generateContent" in m.get("supportedGenerationMethods", [])]
+                for p in modelos_prioritarios:
+                    if p in disponiveis:
+                        return api_version, p
+                if disponiveis:
+                    return api_version, disponiveis[0]
+        except Exception:
+            pass
 
     return "v1beta", "models/gemini-1.5-flash"
 
