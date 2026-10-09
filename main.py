@@ -82,6 +82,14 @@ def time_to_sec(t):
     except:
         return 0
 
+def extrair_nome_entidade(valor):
+    """Extrai o nome de um campo que pode ser dict, string ou nulo com segurança."""
+    if not valor:
+        return ""
+    if isinstance(valor, dict):
+        return str(valor.get("name") or valor.get("nome") or "")
+    return str(valor)
+
 # ==============================================================================
 # 1. COLETA DE DADOS 3C PLUS (VOZ & WHATSAPP OMNI)
 # ==============================================================================
@@ -116,9 +124,11 @@ def coletar_chamadas_3c(token, data_iso):
             
             data = resp.json()
             chamadas_pagina = []
+            last_page = 1
             if isinstance(data, dict):
                 chamadas_pagina = data.get("data") or data.get("calls") or []
-                last_page = data.get("last_page") or data.get("meta", {}).get("last_page") or 1
+                meta_val = data.get("meta")
+                last_page = data.get("last_page") or (meta_val.get("last_page") if isinstance(meta_val, dict) else 1) or 1
             elif isinstance(data, list):
                 chamadas_pagina = data
                 last_page = 1
@@ -188,7 +198,7 @@ def coletar_whatsapp_3c(token, data_iso):
 # 2. CÁLCULO DE MÉTRICAS E EXTRAÇÃO DE DIÁLOGOS QUALITATIVOS
 # ==============================================================================
 def processar_operacoes(chamadas, omni_chats):
-    """Processa métricas quantitativas e extrai conteúdo qualitativo de chamadas e conversas."""
+    """Processa métricas quantitativas e extrai conteúdo qualitativo de chamadas e conversas com proteção de tipos."""
     numeros_distintos = set()
     total_segundos = 0
     vendas_fechadas = []
@@ -205,37 +215,52 @@ def processar_operacoes(chamadas, omni_chats):
     dialogos_clientes_voz = []
 
     for c in chamadas:
-        ag_nome = c.get("agent_name") or (c.get("agent") or {}).get("name") or ""
-        ag_alvo = "Fernanda" if "fernanda" in str(ag_nome).lower() else ("Julia" if "julia" in str(ag_nome).lower() else (ag_nome if ag_nome else "Outros"))
+        if not isinstance(c, dict):
+            continue
+            
+        # Extração segura de agente
+        ag_nome = c.get("agent_name") or extrair_nome_entidade(c.get("agent"))
+        ag_alvo = "Fernanda" if "fernanda" in str(ag_nome).lower() else ("Julia" if "julia" in str(ag_nome).lower() else (str(ag_nome) if ag_nome else "Outros"))
         
         stat = agentes_stats[ag_alvo] if ag_alvo in agentes_stats else outros_stats
         stat["total"] += 1
         
+        # Duração
         dur_seg = time_to_sec(c.get("speaking_with_agent_time") or c.get("talk_time") or c.get("billsec") or 0)
-        qual_nome = str(c.get("qualification_name") or (c.get("qualification") or {}).get("name") or "").strip()
+        
+        # Qualificação segura
+        qual_nome = c.get("qualification_name") or extrair_nome_entidade(c.get("qualification"))
+        qual_nome = str(qual_nome).strip()
         qual_lower = qual_nome.lower()
         
+        # Notas, feedback e transcrição
         nota = str(c.get("qualification_note") or c.get("note") or "").strip()
         feedback = str(c.get("feedback") or "").strip()
         transcricao = str(c.get("transcription") or "").strip()
         
+        # Mailing
         mailing = c.get("mailing_data") or {}
         if isinstance(mailing, str):
             try:
                 mailing = json.loads(mailing)
             except:
                 mailing = {}
+        if not isinstance(mailing, dict):
+            mailing = {}
+
         cliente_nome = mailing.get("Nome Fantasia") or mailing.get("NOME") or str(c.get("number") or "Cliente")
         cidade = mailing.get("Cidade") or ""
         credito = mailing.get("ANÁLISE") or ""
         
-        if dur_seg > 0 or qual_nome != "":
+        # Contato efetivo (conversa humana ativa)
+        if dur_seg > 0 or (qual_nome != "" and qual_nome != "0"):
             stat["efetivas"] += 1
             stat["segundos"] += dur_seg
             total_segundos += dur_seg
             if c.get("number"):
                 numeros_distintos.add(str(c.get("number")))
 
+            # Classificação por Qualificação
             if any(k in qual_lower for k in ["venda", "fechado", "pedido", "comprou"]):
                 stat["vendas"] += 1
                 vendas_fechadas.append({
@@ -261,6 +286,7 @@ def processar_operacoes(chamadas, omni_chats):
                     "numero": c.get("number"), "duracao": sec_to_str(dur_seg), "nota": nota or feedback
                 })
 
+            # Extração de fala / contexto para o diagnóstico qualitativo
             conteudo_expressivo = " | ".join([x for x in [nota, feedback, transcricao] if x]).strip()
             if conteudo_expressivo or dur_seg >= 25:
                 resumo_dialogo = f"Loja: {cliente_nome} ({cidade}) | Qualificação: '{qual_nome}' | Duração: {dur_seg}s"
@@ -273,18 +299,24 @@ def processar_operacoes(chamadas, omni_chats):
                 if len(stat["exemplos"]) < 8:
                     stat["exemplos"].append(resumo_dialogo)
 
+    # Conversas WhatsApp Omni
     dialogos_wpp = []
     for chat in omni_chats:
+        if not isinstance(chat, dict):
+            continue
         c_nome = chat.get("contact_name") or chat.get("name") or "Lojista"
         c_num = chat.get("number") or ""
-        ag_wpp = chat.get("agent_name") or (chat.get("agent") or {}).get("name") or "Atendimento"
+        ag_wpp = chat.get("agent_name") or extrair_nome_entidade(chat.get("agent")) or "Atendimento"
         msgs = chat.get("messages") or []
         extrato_msgs = []
-        for m in msgs[-6:]:
-            remetente = "Cliente" if (m.get("from") in ["contact", "customer", "client"] or not m.get("user_id")) else "Agente"
-            texto = (m.get("text") or m.get("body") or "").strip()
-            if texto:
-                extrato_msgs.append(f"{remetente}: {texto}")
+        if isinstance(msgs, list):
+            for m in msgs[-6:]:
+                if not isinstance(m, dict):
+                    continue
+                remetente = "Cliente" if (m.get("from") in ["contact", "customer", "client"] or not m.get("user_id")) else "Agente"
+                texto = str(m.get("text") or m.get("body") or "").strip()
+                if texto:
+                    extrato_msgs.append(f"{remetente}: {texto}")
         if extrato_msgs:
             dialogos_wpp.append(f"WhatsApp com {c_nome} ({c_num}) [Vendedora: {ag_wpp}]:\n  " + "\n  ".join(extrato_msgs))
 
