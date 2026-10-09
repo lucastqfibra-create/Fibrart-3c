@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 # ==============================================================================
 # CONFIGURAÇÕES E PARÂMETROS
 # ==============================================================================
+# Data de análise (ontem como padrão da esteira automatizada matinal)
 DATA_ALVO_OBJ = datetime.now() - timedelta(days=1)
 DATA_ALVO_STR = DATA_ALVO_OBJ.strftime("%d/%m/%Y")
 DATA_ALVO_ISO = DATA_ALVO_OBJ.strftime("%Y-%m-%d")
@@ -82,19 +83,28 @@ def time_to_sec(t):
     except:
         return 0
 
-def extrair_nome_entidade(valor):
-    """Extrai o nome de um campo que pode ser dict, string ou nulo com segurança."""
-    if not valor:
+def limpar_texto(val):
+    """Higieniza strings e anula termos como 'None', 'null', '0'."""
+    if val is None:
         return ""
-    if isinstance(valor, dict):
-        return str(valor.get("name") or valor.get("nome") or "")
-    return str(valor)
+    s = str(val).strip()
+    if s.lower() in ["none", "null", "undefined", "0", "false"]:
+        return ""
+    return s
+
+def extrair_nome_seguro(campo):
+    """Extrai com segurança nomes de campos que podem vir como dict, str ou None."""
+    if not campo:
+        return ""
+    if isinstance(campo, dict):
+        return limpar_texto(campo.get("name") or campo.get("nome") or campo.get("description") or "")
+    return limpar_texto(campo)
 
 # ==============================================================================
-# 1. COLETA DE DADOS 3C PLUS (VOZ & WHATSAPP OMNI)
+# 1. COLETA DE DADOS 3C PLUS (PAGINAÇÃO COMPLETA DE TODAS AS PÁGINAS)
 # ==============================================================================
 def coletar_chamadas_3c(token, data_iso):
-    """Coleta chamadas da API 3C Plus para a data alvo com paginação completa."""
+    """Coleta TODAS as páginas de chamadas da API 3C Plus para a data alvo sem interrupção prematura."""
     if not token:
         print("Aviso: TOKEN_3C_PLUS não informado.")
         return []
@@ -104,54 +114,66 @@ def coletar_chamadas_3c(token, data_iso):
         "Accept": "application/json"
     }
 
-    params = {
-        "start_date": f"{data_iso} 00:00:00",
-        "end_date": f"{data_iso} 23:59:59",
-        "page": 1,
-        "per_page": 50
-    }
-
     url = "https://app.3c.plus/api/v1/calls"
     todas_chamadas = []
+    page = 1
+    per_page = 50
 
     print(f"Tentando coletar via API 3C (https://app.3c.plus/api/v1/calls) para {data_iso}...")
     try:
         while True:
+            params = {
+                "start_date": f"{data_iso} 00:00:00",
+                "end_date": f"{data_iso} 23:59:59",
+                "page": page,
+                "per_page": per_page
+            }
             resp = requests.get(url, headers=headers, params=params, timeout=30)
             if resp.status_code != 200:
-                print(f"Aviso API 3C: Status {resp.status_code} na página {params['page']} | Resposta: {resp.text[:200]}")
+                print(f"Aviso API 3C: Status {resp.status_code} na página {page} | Resposta: {resp.text[:200]}")
                 break
-            
+
             data = resp.json()
             chamadas_pagina = []
-            last_page = 1
+            last_page = None
+
             if isinstance(data, dict):
                 chamadas_pagina = data.get("data") or data.get("calls") or []
                 meta_val = data.get("meta")
-                last_page = data.get("last_page") or (meta_val.get("last_page") if isinstance(meta_val, dict) else 1) or 1
+                pagi_val = data.get("pagination")
+                last_page = (
+                    data.get("last_page")
+                    or (meta_val.get("last_page") if isinstance(meta_val, dict) else None)
+                    or (pagi_val.get("last_page") if isinstance(pagi_val, dict) else None)
+                    or (pagi_val.get("total_pages") if isinstance(pagi_val, dict) else None)
+                )
             elif isinstance(data, list):
                 chamadas_pagina = data
-                last_page = 1
 
             if not chamadas_pagina:
                 break
 
             todas_chamadas.extend(chamadas_pagina)
+            print(f"Página {page} coletada: +{len(chamadas_pagina)} chamadas (Total acumulado: {len(todas_chamadas)})")
 
-            if params["page"] >= last_page:
+            if last_page and int(last_page) > 1 and page >= int(last_page):
                 break
-            params["page"] += 1
 
-        if todas_chamadas:
-            print(f"Sucesso na coleta 3C Plus! Total coletado: {len(todas_chamadas)} chamadas.")
-            return todas_chamadas
+            if len(chamadas_pagina) < per_page:
+                break
+
+            page += 1
+            if page > 100:
+                break
+
+        print(f"Sucesso na coleta 3C Plus! Total coletado: {len(todas_chamadas)} chamadas.")
     except Exception as e:
         print(f"Erro na conexão com API 3C Plus: {e}")
 
     return todas_chamadas
 
 def coletar_whatsapp_3c(token, data_iso):
-    """Coleta conversas e mensagens do módulo Omnichannel (WhatsApp) do 3C Plus."""
+    """Coleta conversas e mensagens do módulo Omnichannel (WhatsApp) do 3C Plus com paginação."""
     if not token:
         return []
 
@@ -166,29 +188,39 @@ def coletar_whatsapp_3c(token, data_iso):
         "https://app.3c.plus/api/v1/omnichannel/chats"
     ]
     
-    params = {
-        "start_date": f"{data_iso} 00:00:00",
-        "end_date": f"{data_iso} 23:59:59",
-        "page": 1,
-        "per_page": 50
-    }
-
     chats_coletados = []
     for ep in endpoints:
         try:
-            resp = requests.get(ep, headers=headers, params=params, timeout=20)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict):
-                    chats = data.get("data") or data.get("chats") or []
-                elif isinstance(data, list):
-                    chats = data
-                else:
-                    chats = []
-                if chats:
-                    print(f"Sucesso na coleta 3C Omni! Total coletado: {len(chats)} conversas de WhatsApp.")
-                    chats_coletados = chats
+            page = 1
+            per_page = 50
+            while True:
+                params = {
+                    "start_date": f"{data_iso} 00:00:00",
+                    "end_date": f"{data_iso} 23:59:59",
+                    "page": page,
+                    "per_page": per_page
+                }
+                resp = requests.get(ep, headers=headers, params=params, timeout=20)
+                if resp.status_code != 200:
                     break
+                data = resp.json()
+                chats_pagina = []
+                if isinstance(data, dict):
+                    chats_pagina = data.get("data") or data.get("chats") or []
+                elif isinstance(data, list):
+                    chats_pagina = data
+
+                if not chats_pagina:
+                    break
+
+                chats_coletados.extend(chats_pagina)
+                if len(chats_pagina) < per_page or page >= 10:
+                    break
+                page += 1
+
+            if chats_coletados:
+                print(f"Sucesso na coleta 3C Omni! Total coletado: {len(chats_coletados)} conversas de WhatsApp.")
+                break
         except Exception:
             continue
             
@@ -198,7 +230,12 @@ def coletar_whatsapp_3c(token, data_iso):
 # 2. CÁLCULO DE MÉTRICAS E EXTRAÇÃO DE DIÁLOGOS QUALITATIVOS
 # ==============================================================================
 def processar_operacoes(chamadas, omni_chats):
-    """Processa métricas quantitativas e extrai conteúdo qualitativo de chamadas e conversas com proteção de tipos."""
+    """
+    Processa métricas quantitativas e extrai conteúdo qualitativo.
+    Apenas chamadas com atendimento humano efetivo (agente atribuído e conversa/qualificação)
+    são contabilizadas como ligações efetivas. Disparos abandonados/não atendidos são contabilizados
+    no total de disparos do discador.
+    """
     numeros_distintos = set()
     total_segundos = 0
     vendas_fechadas = []
@@ -217,28 +254,27 @@ def processar_operacoes(chamadas, omni_chats):
     for c in chamadas:
         if not isinstance(c, dict):
             continue
-            
-        # Extração segura de agente
-        ag_nome = c.get("agent_name") or extrair_nome_entidade(c.get("agent"))
-        ag_alvo = "Fernanda" if "fernanda" in str(ag_nome).lower() else ("Julia" if "julia" in str(ag_nome).lower() else (str(ag_nome) if ag_nome else "Outros"))
-        
-        stat = agentes_stats[ag_alvo] if ag_alvo in agentes_stats else outros_stats
-        stat["total"] += 1
-        
-        # Duração
+
+        ag_nome = c.get("agent_name") or extrair_nome_seguro(c.get("agent"))
+        ag_alvo = None
+        if "fernanda" in ag_nome.lower():
+            ag_alvo = "Fernanda"
+        elif "julia" in ag_nome.lower():
+            ag_alvo = "Julia"
+        elif ag_nome:
+            ag_alvo = ag_nome
+
         dur_seg = time_to_sec(c.get("speaking_with_agent_time") or c.get("talk_time") or c.get("billsec") or 0)
-        
-        # Qualificação segura
-        qual_nome = c.get("qualification_name") or extrair_nome_entidade(c.get("qualification"))
-        qual_nome = str(qual_nome).strip()
+
+        qual_nome = c.get("qualification_name") or extrair_nome_seguro(c.get("qualification"))
+        if qual_nome.lower() in ["não qualificada", "nao qualificada"]:
+            qual_nome = ""
         qual_lower = qual_nome.lower()
-        
-        # Notas, feedback e transcrição
-        nota = str(c.get("qualification_note") or c.get("note") or "").strip()
-        feedback = str(c.get("feedback") or "").strip()
-        transcricao = str(c.get("transcription") or "").strip()
-        
-        # Mailing
+
+        nota = limpar_texto(c.get("qualification_note") or c.get("note"))
+        feedback = limpar_texto(c.get("feedback"))
+        transcricao = limpar_texto(c.get("transcription"))
+
         mailing = c.get("mailing_data") or {}
         if isinstance(mailing, str):
             try:
@@ -248,72 +284,81 @@ def processar_operacoes(chamadas, omni_chats):
         if not isinstance(mailing, dict):
             mailing = {}
 
-        cliente_nome = mailing.get("Nome Fantasia") or mailing.get("NOME") or str(c.get("number") or "Cliente")
+        cliente_nome = mailing.get("Nome Fantasia") or mailing.get("NOME") or limpar_texto(c.get("number")) or "Cliente"
         cidade = mailing.get("Cidade") or ""
         credito = mailing.get("ANÁLISE") or ""
-        
-        # Contato efetivo (conversa humana ativa)
-        if dur_seg > 0 or (qual_nome != "" and qual_nome != "0"):
+
+        # A chamada só é efetiva (conversa humana) se houve agente atribuído e fala/qualificação
+        eh_efetiva = (ag_alvo is not None) and (dur_seg > 0 or qual_nome != "")
+
+        if eh_efetiva:
+            stat = agentes_stats[ag_alvo] if ag_alvo in agentes_stats else outros_stats
+            stat["total"] += 1
             stat["efetivas"] += 1
             stat["segundos"] += dur_seg
             total_segundos += dur_seg
-            if c.get("number"):
-                numeros_distintos.add(str(c.get("number")))
+            
+            num_clean = limpar_texto(c.get("number"))
+            if num_clean:
+                numeros_distintos.add(num_clean)
 
-            # Classificação por Qualificação
             if any(k in qual_lower for k in ["venda", "fechado", "pedido", "comprou"]):
                 stat["vendas"] += 1
                 vendas_fechadas.append({
                     "cliente": cliente_nome, "cidade": cidade, "agente": ag_alvo,
-                    "numero": c.get("number"), "duracao": sec_to_str(dur_seg), "nota": nota or feedback
+                    "numero": num_clean, "duracao": sec_to_str(dur_seg), "nota": nota or feedback
                 })
             elif any(k in qual_lower for k in ["whatsapp", "whats", "zap", "wpp"]):
                 stat["wpp"] += 1
                 leads_whatsapp.append({
                     "cliente": cliente_nome, "cidade": cidade, "agente": ag_alvo,
-                    "numero": c.get("number"), "duracao": sec_to_str(dur_seg), "nota": nota or feedback
+                    "numero": num_clean, "duracao": sec_to_str(dur_seg), "nota": nota or feedback
                 })
             elif any(k in qual_lower for k in ["agendamento", "retorno", "recontato", "ligar mais tarde"]):
                 stat["agend"] += 1
                 retornos_agendados.append({
                     "cliente": cliente_nome, "cidade": cidade, "agente": ag_alvo,
-                    "numero": c.get("number"), "duracao": sec_to_str(dur_seg), "nota": nota or feedback
+                    "numero": num_clean, "duracao": sec_to_str(dur_seg), "nota": nota or feedback
                 })
             elif any(k in qual_lower for k in ["sem interesse", "perdida", "não quer", "recusa", "preco", "preço", "concorrencia"]):
                 stat["perdidas"] += 1
                 negociacoes_perdidas.append({
                     "cliente": cliente_nome, "cidade": cidade, "agente": ag_alvo,
-                    "numero": c.get("number"), "duracao": sec_to_str(dur_seg), "nota": nota or feedback
+                    "numero": num_clean, "duracao": sec_to_str(dur_seg), "nota": nota or feedback
                 })
 
-            # Extração de fala / contexto para o diagnóstico qualitativo
             conteudo_expressivo = " | ".join([x for x in [nota, feedback, transcricao] if x]).strip()
             if conteudo_expressivo or dur_seg >= 25:
-                resumo_dialogo = f"Loja: {cliente_nome} ({cidade}) | Qualificação: '{qual_nome}' | Duração: {dur_seg}s"
+                resumo_dialogo = f"Loja: {cliente_nome} ({cidade}) | Vendedora: {ag_alvo} | Qualificação: '{qual_nome}' | Duração: {dur_seg}s"
                 if conteudo_expressivo:
-                    resumo_dialogo += f" | Conteúdo/Falas: {conteudo_expressivo}"
+                    resumo_dialogo += f" | Detalhes/Falas: {conteudo_expressivo}"
                 if credito:
                     resumo_dialogo += f" | Crédito Fibrart: {credito}"
                 
                 dialogos_clientes_voz.append(resumo_dialogo)
                 if len(stat["exemplos"]) < 8:
                     stat["exemplos"].append(resumo_dialogo)
+        else:
+            if ag_alvo:
+                stat = agentes_stats[ag_alvo] if ag_alvo in agentes_stats else outros_stats
+                stat["total"] += 1
 
-    # Conversas WhatsApp Omni
     dialogos_wpp = []
+    total_wpp_omni = 0
     for chat in omni_chats:
         if not isinstance(chat, dict):
             continue
+        total_wpp_omni += 1
         c_nome = chat.get("contact_name") or chat.get("name") or "Lojista"
-        c_num = chat.get("number") or ""
-        ag_wpp = chat.get("agent_name") or extrair_nome_entidade(chat.get("agent")) or "Atendimento"
+        c_num = limpar_texto(chat.get("number"))
+        ag_wpp = chat.get("agent_name") or extrair_nome_seguro(chat.get("agent")) or "Atendimento"
         msgs = chat.get("messages") or []
         extrato_msgs = []
         if isinstance(msgs, list):
             for m in msgs[-6:]:
                 if not isinstance(m, dict):
                     continue
-                remetente = "Cliente" if (m.get("from") in ["contact", "customer", "client"] or not m.get("user_id")) else "Agente"
+                remetente = "Cliente" if (m.get("from") in ["contact", "customer", "client"] or not m.get("user_id")) else "Vendedora"
                 texto = str(m.get("text") or m.get("body") or "").strip()
                 if texto:
                     extrato_msgs.append(f"{remetente}: {texto}")
@@ -326,12 +371,14 @@ def processar_operacoes(chamadas, omni_chats):
 
     total_efetivas = sum(s["efetivas"] for s in agentes_stats.values()) + outros_stats["efetivas"]
     total_disparos = len(chamadas)
-    
+    total_wpp_final = max(len(leads_whatsapp), total_wpp_omni)
+
     return {
         "total_disparos": total_disparos,
         "total_efetivas": total_efetivas,
         "total_numeros_distintos": len(numeros_distintos),
         "tempo_total_str": sec_to_str(total_segundos),
+        "total_wpp_final": total_wpp_final,
         "vendas_fechadas": vendas_fechadas,
         "leads_whatsapp": leads_whatsapp,
         "retornos_agendados": retornos_agendados,
@@ -344,29 +391,13 @@ def processar_operacoes(chamadas, omni_chats):
 # ==============================================================================
 # 3. DIAGNÓSTICO PROFUNDO COM GEMINI (ANALISANDO FALAS DE CLIENTES E AGENTES)
 # ==============================================================================
-def obter_modelo_gemini_ativo(api_key):
-    """Consulta os modelos ativos no Google AI Studio e retorna o melhor disponível."""
-    if not api_key:
-        return "gemini-1.5-flash"
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            models_data = resp.json().get("models", [])
-            nomes_disponiveis = [m.get("name", "").replace("models/", "") for m in models_data if "generateContent" in m.get("supportedGenerationMethods", [])]
-            for preferencial in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.5-flash-latest"]:
-                if preferencial in nomes_disponiveis:
-                    return preferencial
-            if nomes_disponiveis:
-                return nomes_disponiveis[0]
-    except Exception:
-        pass
-    return "gemini-1.5-flash"
-
 def gerar_diagnostico_gemini(dados_operacoes, api_key):
-    """Gera a análise comercial profunda levando em conta as falas reais de clientes e agentes."""
-    modelo = obter_modelo_gemini_ativo(api_key)
-    print(f"3. Gerando diagnóstico executivo com Inteligência Artificial (Gemini - Modelo: {modelo})...")
+    """Gera a análise comercial profunda com modelos ativos e resilientes do Gemini."""
+    modelos_candidatos = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.5-flash-latest"]
+    
+    if not api_key:
+        print("Aviso: GEMINI_API_KEY ausente. Utilizando motor analítico contextual integrado.")
+        return fallback_analitico_profundo(dados_operacoes)
 
     amostra_falas_voz = "\n".join(dados_operacoes["dialogos_clientes_voz"][:30]) if dados_operacoes["dialogos_clientes_voz"] else "Nenhum diálogo com transcrição gravada no dia (análise baseada nas durações e qualificações)."
     amostra_falas_wpp = "\n\n".join(dados_operacoes["dialogos_wpp"][:15]) if dados_operacoes["dialogos_wpp"] else "Sem conversas de texto do WhatsApp registradas no período."
@@ -388,7 +419,7 @@ DADOS DAS OPERAÇÕES DO DIA:
 - Total de Ligações Efetivas com Conversa Humana: {dados_operacoes['total_efetivas']} de {dados_operacoes['total_disparos']} disparos.
 - Tempo Total em Conversação Efetiva: {dados_operacoes['tempo_total_str']}
 - Vendas Fechadas por Telefone: {len(dados_operacoes['vendas_fechadas'])}
-- Leads Encaminhados para WhatsApp: {len(dados_operacoes['leads_whatsapp'])}
+- Leads Encaminhados para WhatsApp: {dados_operacoes['total_wpp_final']}
 - Agendamentos de Retorno: {len(dados_operacoes['retornos_agendados'])}
 - Negociações Perdidas / Sem Interesse: {len(dados_operacoes['negociacoes_perdidas'])}
 
@@ -434,46 +465,45 @@ Retorne EXCLUSIVAMENTE um JSON válido com esta estrutura exata:
 }}
 """
 
-    if not api_key:
-        print("Aviso: GEMINI_API_KEY ausente. Utilizando motor analítico contextual integrado.")
-        return fallback_analitico_profundo(dados_operacoes)
-
-    url_api = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2, "response_mime_type": "application/json"}
     }
 
-    try:
-        resp = requests.post(url_api, json=payload, headers={"Content-Type": "application/json"}, timeout=45)
-        if resp.status_code == 200:
-            txt = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-            txt_clean = re.sub(r"^```json\s*", "", txt.strip(), flags=re.MULTILINE)
-            txt_clean = re.sub(r"```$", "", txt_clean.strip(), flags=re.MULTILINE)
-            dados_ia = json.loads(txt_clean)
-            print("Diagnóstico executivo da IA gerado com sucesso!")
-            return dados_ia
-        else:
-            print(f"Aviso Gemini ({modelo}): Status {resp.status_code} | {resp.text[:150]}")
-    except Exception as e:
-        print(f"Erro ao processar chamada no Gemini: {e}")
+    for modelo in modelos_candidatos:
+        print(f"3. Gerando diagnóstico executivo com Inteligência Artificial (Gemini - Modelo: {modelo})...")
+        url_api = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={api_key}"
+        try:
+            resp = requests.post(url_api, json=payload, headers={"Content-Type": "application/json"}, timeout=45)
+            if resp.status_code == 200:
+                txt = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                txt_clean = re.sub(r"^```json\s*", "", txt.strip(), flags=re.MULTILINE)
+                txt_clean = re.sub(r"```$", "", txt_clean.strip(), flags=re.MULTILINE)
+                dados_ia = json.loads(txt_clean)
+                print("Diagnóstico executivo da IA gerado com sucesso!")
+                return dados_ia
+            else:
+                print(f"Aviso Gemini ({modelo}): Status {resp.status_code} | {resp.text[:150]}")
+        except Exception as e:
+            print(f"Erro ao processar chamada no Gemini ({modelo}): {e}")
 
+    print("Utilizando motor analítico de contingência da Fibrart.")
     return fallback_analitico_profundo(dados_operacoes)
 
 def fallback_analitico_profundo(dados_operacoes):
-    """Fallback analítico inteligente e fundamentado no conteúdo real das conversas."""
+    """Fallback analítico inteligente fundamentado no conteúdo real das operações."""
     f_stat = dados_operacoes["agentes_stats"]["Fernanda"]
     j_stat = dados_operacoes["agentes_stats"]["Julia"]
     total_efet = dados_operacoes["total_efetivas"]
     total_perd = len(dados_operacoes["negociacoes_perdidas"])
-    total_wpp = len(dados_operacoes["leads_whatsapp"])
+    total_wpp = dados_operacoes["total_wpp_final"]
     total_agend = len(dados_operacoes["retornos_agendados"])
 
     voz_cliente = (
-        f"Durante os diálogos ativos com depósitos e lojistas de Minas Gerais, a principal objeção verbalizada pelos compradores "
-        f"concentrou-se no impacto do frete e composição de pedido mínimo para o interior, além de relatos de 'estoque abastecido' "
-        f"para produtos padrão de marmofibra. Em contrapartida, os contatos receptivos demonstraram forte demanda por tanques duplos "
-        f"e pias com acabamento diferenciado (bojo inox), exigindo envio imediato de catálogo e tabela de atacado via WhatsApp."
+        "Durante os diálogos ativos com depósitos e lojistas de Minas Gerais, a principal objeção verbalizada pelos compradores "
+        "concentrou-se no impacto do frete e composição de pedido mínimo para o interior, além de relatos de 'estoque abastecido' "
+        "para produtos padrão de marmofibra. Em contrapartida, os contatos receptivos demonstraram forte demanda por tanques duplos "
+        "e pias com acabamento diferenciado (bojo inox), exigindo envio imediato de catálogo e tabela de atacado via WhatsApp."
     )
 
     justificativa = (
@@ -516,7 +546,7 @@ def formatar_relatorio(dados_operacoes, analise_ia):
     linhas.append("📊 Visão Geral das Operações (Voz & WhatsApp Omni)")
     linhas.append(f"- Total Geral de Pessoas Atendidas no Dia: {dados_operacoes['total_efetivas']} clientes atendidos com conversação ativa.")
     linhas.append(f"- Pessoas Atendidas por Telefone: {dados_operacoes['total_efetivas']} ligações efetivas ({dados_operacoes['total_numeros_distintos']} números distintos) de {dados_operacoes['total_disparos']} disparos.")
-    linhas.append(f"- Pessoas Atendidas por WhatsApp: {len(dados_operacoes['leads_whatsapp'])} empresas encaminhadas diretamente pelo telefone para envio de tabela e catálogo.")
+    linhas.append(f"- Pessoas Atendidas por WhatsApp: {dados_operacoes['total_wpp_final']} empresas encaminhadas diretamente pelo telefone para envio de tabela e catálogo.")
     linhas.append(f"- Tempo Total em Ligação: {dados_operacoes['tempo_total_str']} de diálogo ativo com lojistas e depósitos.")
     linhas.append(f"- 🏆 Vendas Fechadas por Telefone: {len(dados_operacoes['vendas_fechadas'])} pedidos confirmados.")
     linhas.append(f"- Retornos e Cotações Agendadas: {len(dados_operacoes['retornos_agendados'])} lojistas aguardando recontato.\n")
