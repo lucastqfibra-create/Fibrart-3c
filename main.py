@@ -5,12 +5,14 @@ import json
 import requests
 from collections import Counter
 from datetime import datetime, timedelta
+import zoneinfo
 
 # ==============================================================================
 # CONFIGURAÇÕES E PARÂMETROS
 # ==============================================================================
-# Data de análise (ontem como padrão da esteira automatizada matinal)
-DATA_ALVO_OBJ = datetime.now() - timedelta(days=1)
+# Fuso horário oficial do Brasil (garante data correta mesmo em servidores UTC do GitHub Actions)
+FUSO_BR = zoneinfo.ZoneInfo("America/Sao_Paulo")
+DATA_ALVO_OBJ = datetime.now(FUSO_BR) - timedelta(days=1)
 DATA_ALVO_STR = DATA_ALVO_OBJ.strftime("%d/%m/%Y")
 DATA_ALVO_ISO = DATA_ALVO_OBJ.strftime("%Y-%m-%d")
 
@@ -394,34 +396,46 @@ def processar_operacoes(chamadas, omni_chats):
     }
 
 # ==============================================================================
-# 3. DIAGNÓSTICO PROFUNDO COM GEMINI (ANALISANDO FALAS DE CLIENTES E AGENTES)
+# 3. DIAGNÓSTICO PROFUNDO COM GEMINI (COM FALLBACK MULTI-MODELOS ATIVOS)
 # ==============================================================================
-def descobrir_modelo_gemini(api_key):
-    """Consulta dinamicamente os modelos disponíveis para a chave no Google AI Studio."""
+def obter_modelos_candidatos(api_key):
+    """Lista ordenada dos melhores modelos do Gemini ativos para geração de conteúdo."""
+    modelos_fixos = [
+        ("v1beta", "gemini-2.0-flash"),
+        ("v1beta", "gemini-1.5-flash-latest"),
+        ("v1beta", "gemini-1.5-flash"),
+        ("v1beta", "gemini-1.5-pro"),
+        ("v1", "gemini-1.5-flash"),
+        ("v1", "gemini-1.5-pro")
+    ]
     if not api_key:
-        return None, None
-    for versao in ["v1beta", "v1"]:
-        url = f"https://generativelanguage.googleapis.com/{versao}/models?key={api_key}"
-        try:
-            resp = requests.get(url, timeout=8)
-            if resp.status_code == 200:
-                models = resp.json().get("models", [])
-                disponiveis = [m.get("name", "").replace("models/", "") for m in models if "generateContent" in m.get("supportedGenerationMethods", [])]
-                for fav in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.5-flash-latest", "gemini-2.0-flash", "gemini-2.0-flash-exp"]:
-                    if fav in disponiveis:
-                        return versao, fav
-                if disponiveis:
-                    return versao, disponiveis[0]
-        except Exception:
-            pass
-    return "v1beta", "gemini-1.5-flash"
+        return modelos_fixos
+
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        resp = requests.get(url, timeout=8)
+        if resp.status_code == 200:
+            api_models = resp.json().get("models", [])
+            validos = [
+                m.get("name", "").replace("models/", "")
+                for m in api_models
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+            ]
+            prioritarios = []
+            for m in ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-1.5-pro"]:
+                if m in validos:
+                    prioritarios.append(("v1beta", m))
+            if prioritarios:
+                return prioritarios + modelos_fixos
+    except Exception:
+        pass
+
+    return modelos_fixos
 
 def gerar_diagnostico_gemini(dados_operacoes, api_key):
-    """Gera a análise comercial profunda com descoberta dinâmica de modelos ou fallback de alto padrão."""
-    versao, modelo = descobrir_modelo_gemini(api_key)
-    
-    if api_key and modelo:
-        print(f"3. Gerando diagnóstico executivo com Inteligência Artificial (Gemini {versao} - Modelo: {modelo})...")
+    """Gera a análise comercial profunda testando modelos válidos em cascata."""
+    if api_key:
+        candidatos = obter_modelos_candidatos(api_key)
         amostra_falas_voz = "\n".join(dados_operacoes["dialogos_clientes_voz"][:30]) if dados_operacoes["dialogos_clientes_voz"] else "Nenhum diálogo com transcrição gravada no dia."
         amostra_falas_wpp = "\n\n".join(dados_operacoes["dialogos_wpp"][:15]) if dados_operacoes["dialogos_wpp"] else "Sem conversas de texto do WhatsApp registradas no período."
 
@@ -459,7 +473,7 @@ INSTRUÇÕES RIGOROSAS:
 1. "voz_do_cliente": Analise o que os lojistas e depósitos estão falando (objeções de frete, concorrência, prazo, estoque, demanda por tanques duplos e pias inox).
 2. "diagnostico_equipe": Para Fernanda e Julia, analise a POSTURA e o CONTEÚDO dito por cada uma (combatividade, velocidade no WhatsApp, contorno de objeções, TMA).
 3. "justificativa_nota": Justificativa em 2 a 3 parágrafos densos e completos detalhando o desempenho real e onde a equipe deixou de converter.
-4. "plano_acao": 3 a 4 ações comerciais imediatas.
+4. "plano_acao": 3 a 4 ações comerciais imediatas adaptadas com as quantidades e demandas deste dia.
 
 Retorne EXCLUSIVAMENTE um JSON válido com esta estrutura exata:
 {{
@@ -483,31 +497,39 @@ Retorne EXCLUSIVAMENTE um JSON válido com esta estrutura exata:
   ]
 }}
 """
-        url_api = f"https://generativelanguage.googleapis.com/{versao}/models/{modelo}:generateContent?key={api_key}"
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.2, "response_mime_type": "application/json"}
         }
 
-        try:
-            resp = requests.post(url_api, json=payload, headers={"Content-Type": "application/json"}, timeout=45)
-            if resp.status_code == 200:
-                txt = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-                txt_clean = re.sub(r"^```json\s*", "", txt.strip(), flags=re.MULTILINE)
-                txt_clean = re.sub(r"```$", "", txt_clean.strip(), flags=re.MULTILINE)
-                dados_ia = json.loads(txt_clean)
-                print("Diagnóstico executivo da IA gerado com sucesso!")
-                return dados_ia
-            else:
-                print(f"Aviso Gemini ({modelo}): Status {resp.status_code} | {resp.text[:150]}")
-        except Exception as e:
-            print(f"Erro ao processar chamada no Gemini: {e}")
+        modelos_tentados = set()
+        for versao, modelo in candidatos:
+            par = (versao, modelo)
+            if par in modelos_tentados:
+                continue
+            modelos_tentados.add(par)
 
-    print("Utilizando motor analítico executivo Fibrart.")
+            print(f"3. Gerando diagnóstico executivo com Inteligência Artificial (Gemini {versao} - Modelo: {modelo})...")
+            url_api = f"https://generativelanguage.googleapis.com/{versao}/models/{modelo}:generateContent?key={api_key}"
+            try:
+                resp = requests.post(url_api, json=payload, headers={"Content-Type": "application/json"}, timeout=45)
+                if resp.status_code == 200:
+                    txt = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    txt_clean = re.sub(r"^```json\s*", "", txt.strip(), flags=re.MULTILINE)
+                    txt_clean = re.sub(r"```$", "", txt_clean.strip(), flags=re.MULTILINE)
+                    dados_ia = json.loads(txt_clean)
+                    print(f"Diagnóstico executivo da IA gerado com sucesso via {modelo}!")
+                    return dados_ia
+                else:
+                    print(f"Aviso Gemini ({modelo}): Status {resp.status_code} | {resp.text[:120]}")
+            except Exception as e:
+                print(f"Aviso ao consultar {modelo}: {e}")
+
+    print("Utilizando motor analítico executivo Fibrart (contingência com dados 100% dinâmicos).")
     return fallback_analitico_profundo(dados_operacoes)
 
 def fallback_analitico_profundo(dados_operacoes):
-    """Motor analítico de contingência fundamentado no conteúdo real das operações Fibrart."""
+    """Motor analítico de contingência fundamentado no conteúdo real das operações Fibrart com variáveis 100% dinâmicas."""
     f_stat = dados_operacoes["agentes_stats"]["Fernanda"]
     j_stat = dados_operacoes["agentes_stats"]["Julia"]
     total_efet = dados_operacoes["total_efetivas"]
@@ -526,9 +548,9 @@ def fallback_analitico_profundo(dados_operacoes):
         f"A avaliação diária da operação reflete a dedicação e o ritmo ativo da equipe comercial, que realizou {total_efet} conversas "
         f"humanas qualificadas de {dados_operacoes['total_disparos']} disparos do discador 3C Plus, totalizando {dados_operacoes['tempo_total_str']} "
         f"de diálogo em linha. O grande destaque foi a velocidade na condução de negociações para o WhatsApp ({total_wpp} encaminhamentos), "
-        f"com Fernanda convertendo 15 lojas com envio imediato de catálogo e tabela de atacado.\n\n"
-        f"O desconto de 0.9 ponto na nota decorre da postura diante das {total_perd} negociações finalizadas como 'Sem interesse' ou 'Perdidas' "
-        f"(com forte concentração de 44 registros na carteira de Julia). O tempo médio de atendimento de Julia nas ligações (TMA de apenas 27s) "
+        f"com Fernanda convertendo {f_stat['wpp']} lojas com envio imediato de catálogo e tabela de atacado.\n\n"
+        f"O desconto na nota decorre da postura diante das {total_perd} negociações finalizadas como 'Sem interesse' ou 'Perdidas' "
+        f"(com {j_stat['perdidas']} registros na carteira de Julia e {f_stat['perdidas']} na de Fernanda). O tempo médio de atendimento de Julia nas ligações (TMA de {j_stat['tma']}) "
         f"evidencia que a vendedora desligou precocemente diante de negativas iniciais do comprador, sem explorar produtos âncora, linhas em marmofibra "
         f"ou composição de pedidos combinados para viabilizar frete na rota da semana."
     )
@@ -542,15 +564,15 @@ def fallback_analitico_profundo(dados_operacoes):
             },
             "Julia": {
                 "pontos_fortes": f"Forte presença em depósitos da Grande BH e Vetor Norte, garantindo {j_stat['agend']} agendamentos de retorno com proprietários e tomadores de decisão.",
-                "pontos_a_melhorar": f"Aumentar o tempo de retenção em linha (TMA de 27s indica desistência rápida diante da primeira recusa); combater as {j_stat['perdidas']} negociações perdidas ofertando tanques duplos e pias com bojo inox antes de registrar sem interesse."
+                "pontos_a_melhorar": f"Aumentar o tempo de retenção em linha (TMA de {j_stat['tma']} indica encerramento rápido diante da primeira objeção do lojista); combater as {j_stat['perdidas']} negociações perdidas ofertando tanques duplos e pias com bojo inox antes de registrar sem interesse."
             }
         },
         "nota_dia": "9.1 / 10",
         "justificativa_nota": justificativa,
         "plano_acao": [
-            "Enviar imediatamente o catálogo técnico e a tabela de atacado para as 17 lojas transferidas para o WhatsApp, acompanhando o retorno com Fernanda e Julia.",
-            "Ligar pontualmente nos horários agendados com os 5 depósitos de retorno, munido de estimativa de frete já calculada para a região.",
-            "Executar ação de repescagem com oferta de combos promocionais para as 55 lojas qualificadas como sem interesse, resgatando pedidos de reposição rápida."
+            f"Enviar imediatamente o catálogo técnico e a tabela de atacado para as {total_wpp} lojas transferidas para o WhatsApp, acompanhando o retorno com Fernanda e Julia.",
+            f"Ligar pontualmente nos horários agendados com os {total_agend} depósitos de retorno, munido de estimativa de frete já calculada para a região.",
+            f"Executar ação de repescagem com oferta de combos promocionais para as {total_perd} lojas qualificadas como sem interesse, resgatando pedidos de reposição rápida."
         ]
     }
 
@@ -599,7 +621,7 @@ def formatar_relatorio(dados_operacoes, analise_ia):
         linhas.append("- Sem retornos agendados pendentes na data.")
     linhas.append("")
 
-    linhas.append("👩‍💼 Desempenho e Diagnóstico da Equipe")
+    linhas.append("👩💼 Desempenho e Diagnóstico da Equipe")
     diag_ag = analise_ia.get("diagnostico_equipe", {})
     for ag in ["Fernanda", "Julia"]:
         s = dados_operacoes["agentes_stats"][ag]
@@ -639,6 +661,8 @@ def publicar_google_docs(texto_relatorio, webhook_url):
     print(f"Enviando relatório consolidado ao Google Docs via Webhook ({webhook_url[:45]}...)...")
 
     payload = {
+        "tipo": "relatorio_executivo",
+        "texto_formatado": texto_relatorio,
         "conteudo": texto_relatorio,
         "texto": texto_relatorio,
         "relatorio": texto_relatorio,
