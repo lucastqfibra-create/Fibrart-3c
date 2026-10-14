@@ -2,9 +2,14 @@ name: Relatório Diário 3C Plus & Gemini
 
 on:
   schedule:
-    - cron: '37 10 * * 2-6'
+    # 09:15 UTC = 06:15 Horário de Brasília (Terça a Sábado)
+    - cron: '15 9 * * 2-6'
   workflow_dispatch:
-
+    inputs:
+      data_manual:
+        description: 'Data opcional para processar (DD/MM/YYYY)'
+        required: false
+        default: ''
 jobs:
   executar-analise:
     runs-on: ubuntu-latest
