@@ -2,6 +2,9 @@ import os
 import re
 import sys
 import json
+import base64
+import tempfile
+import subprocess
 import requests
 from collections import Counter
 from datetime import datetime, timedelta
@@ -12,7 +15,20 @@ import zoneinfo
 # ==============================================================================
 # Fuso horário oficial do Brasil (garante data correta mesmo em servidores UTC do GitHub Actions)
 FUSO_BR = zoneinfo.ZoneInfo("America/Sao_Paulo")
-DATA_ALVO_OBJ = datetime.now(FUSO_BR) - timedelta(days=1)
+
+def definir_data_alvo():
+    """Permite sobrescrever a data via variável DATA_MANUAL (DD/MM/YYYY ou YYYY-MM-DD) ou usa ontem por padrão."""
+    data_manual = os.getenv("DATA_MANUAL", "").strip()
+    if data_manual:
+        for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(data_manual, fmt)
+                return dt
+            except ValueError:
+                pass
+    return datetime.now(FUSO_BR) - timedelta(days=1)
+
+DATA_ALVO_OBJ = definir_data_alvo()
 DATA_ALVO_STR = DATA_ALVO_OBJ.strftime("%d/%m/%Y")
 DATA_ALVO_ISO = DATA_ALVO_OBJ.strftime("%Y-%m-%d")
 
@@ -30,6 +46,38 @@ DIA_SEMANA_STR = DIAS_SEMANA.get(DATA_ALVO_OBJ.weekday(), "")
 TOKEN_3C_PLUS = os.getenv("TOKEN_3C_PLUS", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GOOGLE_DOCS_WEBHOOK_URL_RAW = os.getenv("GOOGLE_DOCS_WEBHOOK_URL", "").strip()
+
+# Parâmetros de transcrição de áudio
+DURACAO_MINIMA_TRANSCRICAO = int(os.getenv("DURACAO_MINIMA_SEGUNDOS", "12"))
+MAX_TRANSCRICOES_DIA = int(os.getenv("MAX_TRANSCRICOES", "35"))
+
+INITIAL_PROMPT_WHISPER = (
+    "Fibrart Tanques e Pias. Atendimento comercial B2B de televendas e representantes. "
+    "Produtos em marmofibra: tanques simples, tanques duplos, tanques triplos, pia de fibra, "
+    "pias com bojo inox, lavatórios, gabinetes, bacia, bancada, válvulas. "
+    "Cores: branco liso, preto aracruz, cinza andorinha, bege bahia. "
+    "Termos comerciais e logística: orçamentos, cotação, pedidos, tabela de preços, nota fiscal, "
+    "faturamento, boleto, rotas de entrega, frete, prazo, região, Grande BH, interior de Minas Gerais."
+)
+
+SUBSTITUICOES_FONETICAS = [
+    (r"\b(fibracha|pipaste|fibrate|fibrati|fibrac|fibrarte|fibrat|fibra\s*art|fibra\s*arte)\b", "Fibrart"),
+    (r"\b(feijão)\b", "região"),
+    (r"\bmarmo\s+fibra\b", "marmofibra"),
+    (r"\bbojo\s+inóx\b", "bojo inox"),
+]
+
+def pos_processar_transcricao(texto):
+    """Normaliza termos industriais da Fibrart e limpa ruídos de transcrição."""
+    if not texto:
+        return ""
+    limpo = texto.strip()
+    for padrao, subst in SUBSTITUICOES_FONETICAS:
+        limpo = re.sub(padrao, subst, limpo, flags=re.IGNORECASE)
+    limpo = re.sub(r"\s+", " ", limpo).strip()
+    if any(k in limpo.lower() for k in ["sem diálogo útil", "sem dialogo util", "áudio mudo", "caixa postal"]):
+        return ""
+    return limpo
 
 def limpar_url_webhook(raw_url):
     """Extrai estritamente a URL válida, eliminando colchetes, aspas ou caracteres estranhos."""
@@ -102,6 +150,73 @@ def extrair_nome_seguro(campo):
         return limpar_texto(campo.get("name") or campo.get("nome") or "")
     return limpar_texto(campo)
 
+def extrair_dados_mailing(c):
+    """Desempacota mailing_data em qualquer estrutura retornada pela API 3C Plus (dict direto, aninhado em 'data' ou JSON)."""
+    raw = c.get("mailing_data") or c.get("mailing") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+    if isinstance(raw, dict) and "data" in raw:
+        inner = raw.get("data")
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(inner)
+            except Exception:
+                inner = {}
+        if isinstance(inner, dict):
+            raw = inner
+    if not isinstance(raw, dict):
+        return {}
+    return raw
+
+# ==============================================================================
+# DESCOBERTA DINÂMICA DE MODELOS GEMINI ATIVOS NA CHAVE
+# ==============================================================================
+MODELO_GEMINI_CACHE = None
+
+def obter_modelos_candidatos(api_key):
+    """Lista dinamicamente todos os modelos com suporte a generateContent habilitados para a chave."""
+    modelos_padrao = [
+        ("v1beta", "gemini-2.5-flash-lite"),
+        ("v1beta", "gemini-2.5-pro"),
+        ("v1beta", "gemini-2.0-flash"),
+        ("v1beta", "gemini-2.0-flash-lite"),
+        ("v1beta", "gemini-1.5-flash-latest"),
+        ("v1beta", "gemini-1.5-pro-latest"),
+    ]
+    if not api_key:
+        return modelos_padrao
+
+    descobertos = []
+    for versao in ["v1beta", "v1"]:
+        try:
+            url = f"https://generativelanguage.googleapis.com/{versao}/models?key={api_key}"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                api_models = resp.json().get("models", [])
+                nomes = [
+                    m.get("name", "").replace("models/", "")
+                    for m in api_models
+                    if "generateContent" in m.get("supportedGenerationMethods", [])
+                ]
+                if versao == "v1beta" and nomes:
+                    print(f"Modelos Gemini identificados na conta ({len(nomes)}): {', '.join(nomes[:10])}")
+                preferidos = [n for n in nomes if ("flash" in n or "pro" in n) and n != "gemini-2.5-flash" and "tts" not in n and "image" not in n and "vision" not in n]
+                outros = [n for n in nomes if n not in preferidos and "tts" not in n and "image" not in n]
+                for m in preferidos + outros:
+                    par = (versao, m)
+                    if par not in descobertos:
+                        descobertos.append(par)
+        except Exception:
+            pass
+
+    for p in modelos_padrao:
+        if p not in descobertos:
+            descobertos.append(p)
+    return descobertos
+
 # ==============================================================================
 # 1. COLETA DE DADOS 3C PLUS (PAGINAÇÃO COMPLETA DE TODAS AS PÁGINAS)
 # ==============================================================================
@@ -128,7 +243,8 @@ def coletar_chamadas_3c(token, data_iso):
                 "start_date": f"{data_iso} 00:00:00",
                 "end_date": f"{data_iso} 23:59:59",
                 "page": page,
-                "per_page": per_page
+                "per_page": per_page,
+                "with_mailing": "true"
             }
             resp = requests.get(url, headers=headers, params=params, timeout=30)
             if resp.status_code != 200:
@@ -229,14 +345,109 @@ def coletar_whatsapp_3c(token, data_iso):
     return chats_coletados
 
 # ==============================================================================
-# 2. CÁLCULO DE MÉTRICAS E EXTRAÇÃO DE DIÁLOGOS QUALITATIVOS
+# 2. DOWNLOAD E TRANSCRIÇÃO DE GRAVAÇÕES DE ÁUDIO DA 3C PLUS
 # ==============================================================================
-def processar_operacoes(chamadas, omni_chats):
+def baixar_audio_3c(recording_url, token):
+    """Baixa os bytes do arquivo de gravação de áudio de uma chamada da 3C Plus."""
+    if not recording_url or not token:
+        return None, None
+
+    headers = {"Authorization": f"Bearer {token}"}
+    urls_tentativa = [recording_url]
+    if "api_token=" not in recording_url:
+        sep = "&" if "?" in recording_url else "?"
+        urls_tentativa.append(f"{recording_url}{sep}api_token={token}")
+
+    for u in urls_tentativa:
+        try:
+            resp = requests.get(u, headers=headers, timeout=25, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.content) > 800:
+                ctype = resp.headers.get("Content-Type", "").lower()
+                magic = resp.content[:4]
+                if magic == b"RIFF" or "wav" in ctype:
+                    mime = "audio/wav"
+                elif magic == b"OggS" or "ogg" in ctype:
+                    mime = "audio/ogg"
+                else:
+                    mime = "audio/mp3"
+                return resp.content, mime
+        except Exception:
+            pass
+    return None, None
+
+def transcrever_audio_gemini_ou_whisper(audio_bytes, mime_type, api_key, candidatos_gemini, model_whisper=None):
     """
-    Processa métricas quantitativas e extrai conteúdo qualitativo.
+    Transcreve o áudio da chamada comercial usando:
+    1) Gemini Multimodal Audio (rápido, separa Vendedora vs Cliente)
+    2) Fallback para OpenAI Whisper local (se instalado no ambiente)
+    """
+    global MODELO_GEMINI_CACHE
+    if not audio_bytes:
+        return ""
+
+    # 1. Tentativa via Gemini Multimodal Audio
+    if api_key:
+        b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+        prompt_audio = (
+            "Transcreva em português de forma fiel e objetiva o diálogo desta ligação comercial da Fibrart (fábrica de tanques e pias). "
+            "Identifique resumidamente o que a Vendedora disse e o que o Cliente respondeu (ex: Vendedora: ... | Cliente: ...). "
+            "Se for apenas toque de telefone, secretária eletrônica ou silêncio sem conversa humana, responda estritamente: [Sem diálogo útil]."
+        )
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt_audio},
+                    {"inline_data": {"mime_type": mime_type, "data": b64_audio}}
+                ]
+            }],
+            "generationConfig": {"temperature": 0.1}
+        }
+
+        lista_busca = [MODELO_GEMINI_CACHE] if MODELO_GEMINI_CACHE else candidatos_gemini
+        for par in lista_busca:
+            if not par:
+                continue
+            versao, modelo = par
+            url_api = f"https://generativelanguage.googleapis.com/{versao}/models/{modelo}:generateContent?key={api_key}"
+            try:
+                resp = requests.post(url_api, json=payload, headers={"Content-Type": "application/json"}, timeout=35)
+                if resp.status_code == 200:
+                    MODELO_GEMINI_CACHE = (versao, modelo)
+                    partes = resp.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                    if partes:
+                        texto = partes[0].get("text", "").strip()
+                        return pos_processar_transcricao(texto)
+            except Exception:
+                pass
+
+    # 2. Tentativa via Whisper local (caso instalado no runner)
+    if model_whisper is not None:
+        try:
+            ext = ".wav" if "wav" in mime_type else ".mp3"
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
+            wav_path = tmp_path + ".wav"
+            subprocess.run(["ffmpeg", "-y", "-i", tmp_path, wav_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            alvo = wav_path if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0 else tmp_path
+            res = model_whisper.transcribe(alvo, language="pt", initial_prompt=INITIAL_PROMPT_WHISPER)
+            for p in (tmp_path, wav_path):
+                if os.path.exists(p):
+                    os.remove(p)
+            return pos_processar_transcricao(res.get("text", ""))
+        except Exception:
+            pass
+
+    return ""
+
+# ==============================================================================
+# 3. CÁLCULO DE MÉTRICAS E EXTRAÇÃO DE DIÁLOGOS QUALITATIVOS
+# ==============================================================================
+def processar_operacoes(chamadas, omni_chats, token_3c="", gemini_key=""):
+    """
+    Processa métricas quantitativas, baixa gravações das chamadas relevantes e extrai transcrições reais.
     Uma chamada é EFETIVA (conversa com cliente) exclusivamente quando atendida por uma
     vendedora humana (Fernanda, Julia ou equipe) com tempo de conversação ativo (dur_seg > 0).
-    Tentativas abandonadas pelo discador ou sem atendimento ficam contabilizadas nos disparos totais.
     """
     numeros_distintos = set()
     total_segundos = 0
@@ -244,6 +455,7 @@ def processar_operacoes(chamadas, omni_chats):
     leads_whatsapp = []
     retornos_agendados = []
     negociacoes_perdidas = []
+    candidatas_transcricao = []
     
     agentes_stats = {
         "Fernanda": {"efetivas": 0, "segundos": 0, "vendas": 0, "wpp": 0, "agend": 0, "perdidas": 0, "exemplos": []},
@@ -278,28 +490,32 @@ def processar_operacoes(chamadas, omni_chats):
             qual_nome_comercial = qual_nome
         qual_lower = qual_nome_comercial.lower()
 
-        # Notas, feedback e transcrição
+        # Notas, feedback e transcrição nativa (se houver)
         nota = limpar_texto(c.get("qualification_note") or c.get("note"))
         feedback = limpar_texto(c.get("feedback"))
         transcricao = limpar_texto(c.get("transcription"))
 
-        # Mailing
-        mailing = c.get("mailing_data") or {}
-        if isinstance(mailing, str):
-            try:
-                mailing = json.loads(mailing)
-            except:
-                mailing = {}
-        if not isinstance(mailing, dict):
-            mailing = {}
+        # URL da gravação de áudio na 3C Plus
+        call_id = limpar_texto(c.get("_id") or c.get("id"))
+        recording_url = limpar_texto(c.get("recording") or c.get("recording_url"))
+        if not recording_url and call_id:
+            recording_url = f"https://app.3c.plus/api/v1/calls/{call_id}/recording"
 
-        num_clean = limpar_texto(c.get("number"))
-        cliente_nome = mailing.get("Nome Fantasia") or mailing.get("NOME") or num_clean or "Cliente"
-        cidade = mailing.get("Cidade") or ""
-        credito = mailing.get("ANÁLISE") or ""
+        # Mailing desempacotado (pega Nome Fantasia, Razão Social e Cidade reais)
+        mailing = extrair_dados_mailing(c)
+        num_clean = limpar_texto(c.get("number") or c.get("phone"))
+        cliente_nome = (
+            limpar_texto(mailing.get("Nome Fantasia"))
+            or limpar_texto(mailing.get("NOME"))
+            or limpar_texto(mailing.get("razao_social"))
+            or limpar_texto(mailing.get("nome"))
+            or num_clean
+            or "Cliente"
+        )
+        cidade = limpar_texto(mailing.get("Cidade") or mailing.get("cidade") or mailing.get("uf"))
+        credito = limpar_texto(mailing.get("ANÁLISE") or mailing.get("analise"))
 
         # CONDIÇÃO RIGOROSA DE ATENDIMENTO EFETIVO:
-        # Apenas chamadas atendidas por vendedora da equipe comercial com conversa real (dur_seg > 0)
         if ag_alvo and dur_seg > 0:
             stat = agentes_stats[ag_alvo]
             stat["efetivas"] += 1
@@ -309,44 +525,87 @@ def processar_operacoes(chamadas, omni_chats):
             if num_clean:
                 numeros_distintos.add(num_clean)
 
+            registro_item = {
+                "cliente": cliente_nome,
+                "cidade": cidade,
+                "agente": ag_alvo,
+                "numero": num_clean,
+                "duracao": sec_to_str(dur_seg),
+                "dur_seg": dur_seg,
+                "qualificacao": qual_nome_comercial or "Atendida",
+                "nota": nota or feedback,
+                "transcricao": transcricao,
+                "recording_url": recording_url,
+                "credito": credito,
+                "prioridade": 4
+            }
+
             # Classificação da negociação
             if any(k in qual_lower for k in ["venda", "fechado", "pedido", "comprou"]):
                 stat["vendas"] += 1
-                vendas_fechadas.append({
-                    "cliente": cliente_nome, "cidade": cidade, "agente": ag_alvo,
-                    "numero": num_clean, "duracao": sec_to_str(dur_seg), "nota": nota or feedback
-                })
+                registro_item["prioridade"] = 1
+                vendas_fechadas.append(registro_item)
             elif any(k in qual_lower for k in ["whatsapp", "whats", "zap", "wpp"]):
                 stat["wpp"] += 1
-                leads_whatsapp.append({
-                    "cliente": cliente_nome, "cidade": cidade, "agente": ag_alvo,
-                    "numero": num_clean, "duracao": sec_to_str(dur_seg), "nota": nota or feedback
-                })
+                registro_item["prioridade"] = 2
+                leads_whatsapp.append(registro_item)
             elif any(k in qual_lower for k in ["agendamento", "retorno", "recontato", "ligar mais tarde"]):
                 stat["agend"] += 1
-                retornos_agendados.append({
-                    "cliente": cliente_nome, "cidade": cidade, "agente": ag_alvo,
-                    "numero": num_clean, "duracao": sec_to_str(dur_seg), "nota": nota or feedback
-                })
+                registro_item["prioridade"] = 3
+                retornos_agendados.append(registro_item)
             elif any(k in qual_lower for k in ["sem interesse", "perdida", "não quer", "recusa", "preco", "preço", "concorrencia"]):
                 stat["perdidas"] += 1
-                negociacoes_perdidas.append({
-                    "cliente": cliente_nome, "cidade": cidade, "agente": ag_alvo,
-                    "numero": num_clean, "duracao": sec_to_str(dur_seg), "nota": nota or feedback
-                })
+                negociacoes_perdidas.append(registro_item)
 
-            # Extração de falas e contexto para análise qualitativa
-            conteudo_expressivo = " | ".join([x for x in [nota, feedback, transcricao] if x]).strip()
-            if conteudo_expressivo or dur_seg >= 25:
-                resumo_dialogo = f"Loja: {cliente_nome} ({cidade}) | Vendedora: {ag_alvo} | Qualificação: '{qual_nome_comercial}' | Duração: {dur_seg}s"
-                if conteudo_expressivo:
-                    resumo_dialogo += f" | Detalhes/Falas: {conteudo_expressivo}"
-                if credito:
-                    resumo_dialogo += f" | Crédito Fibrart: {credito}"
-                
-                dialogos_clientes_voz.append(resumo_dialogo)
-                if len(stat["exemplos"]) < 8:
-                    stat["exemplos"].append(resumo_dialogo)
+            if dur_seg >= DURACAO_MINIMA_TRANSCRICAO and recording_url and not transcricao:
+                candidatas_transcricao.append(registro_item)
+
+    # Executa a transcrição das gravações de áudio das chamadas efetivas mais relevantes
+    transcricoes_realizadas = []
+    if candidatas_transcricao and token_3c:
+        candidatas_transcricao.sort(key=lambda x: (x["prioridade"], -x["dur_seg"]))
+        selecionadas = candidatas_transcricao[:MAX_TRANSCRICOES_DIA]
+        print(f"2.1. Baixando e transcrevendo áudios de {len(selecionadas)} chamadas efetivas (duração >= {DURACAO_MINIMA_TRANSCRICAO}s)...")
+
+        candidatos_gemini = obter_modelos_candidatos(gemini_key) if gemini_key else []
+        model_whisper = None
+        if not gemini_key:
+            try:
+                import whisper
+                model_whisper = whisper.load_model("base")
+            except Exception:
+                model_whisper = None
+
+        for idx, item in enumerate(selecionadas, 1):
+            audio_bytes, mime_type = baixar_audio_3c(item["recording_url"], token_3c)
+            if audio_bytes:
+                texto_transcrito = transcrever_audio_gemini_ou_whisper(
+                    audio_bytes, mime_type, gemini_key, candidatos_gemini, model_whisper
+                )
+                if texto_transcrito:
+                    item["transcricao"] = texto_transcrito
+                    transcricoes_realizadas.append(item)
+                    print(f"  [Áudio {idx}/{len(selecionadas)}] {item['agente']} -> {item['cliente']} ({item['duracao']}): {texto_transcrito[:110]}...")
+
+    # Monta resumos de diálogos para o diagnóstico executivo
+    todas_efetivas = vendas_fechadas + leads_whatsapp + retornos_agendados + negociacoes_perdidas
+    for item in todas_efetivas:
+        conteudo_expressivo = " | ".join([x for x in [item["nota"], item["transcricao"]] if x]).strip()
+        if conteudo_expressivo or item["dur_seg"] >= 25:
+            cid_info = f" ({item['cidade']})" if item["cidade"] else ""
+            resumo_dialogo = (
+                f"Loja: {item['cliente']}{cid_info} | Tel: {item['numero']} | Vendedora: {item['agente']} | "
+                f"Qualificação: '{item['qualificacao']}' | Duração: {item['duracao']}"
+            )
+            if conteudo_expressivo:
+                resumo_dialogo += f" | Diálogo/Transcrição: {conteudo_expressivo}"
+            if item["credito"]:
+                resumo_dialogo += f" | Crédito Fibrart: {item['credito']}"
+
+            dialogos_clientes_voz.append(resumo_dialogo)
+            stat = agentes_stats[item["agente"]]
+            if len(stat["exemplos"]) < 10:
+                stat["exemplos"].append(resumo_dialogo)
 
     # Conversas WhatsApp Omni
     dialogos_wpp = []
@@ -392,65 +651,32 @@ def processar_operacoes(chamadas, omni_chats):
         "negociacoes_perdidas": negociacoes_perdidas,
         "agentes_stats": agentes_stats,
         "dialogos_clientes_voz": dialogos_clientes_voz,
+        "transcricoes_realizadas": transcricoes_realizadas,
         "dialogos_wpp": dialogos_wpp
     }
 
 # ==============================================================================
-# 3. DIAGNÓSTICO PROFUNDO COM GEMINI (COM FALLBACK MULTI-MODELOS ATIVOS)
+# 4. DIAGNÓSTICO PROFUNDO COM GEMINI (COM FALLBACK MULTI-MODELOS ATIVOS)
 # ==============================================================================
-def obter_modelos_candidatos(api_key):
-    """Lista ordenada dos melhores modelos do Gemini ativos para geração de conteúdo."""
-    modelos_fixos = [
-        ("v1beta", "gemini-2.0-flash"),
-        ("v1beta", "gemini-1.5-flash-latest"),
-        ("v1beta", "gemini-1.5-flash"),
-        ("v1beta", "gemini-1.5-pro"),
-        ("v1", "gemini-1.5-flash"),
-        ("v1", "gemini-1.5-pro")
-    ]
-    if not api_key:
-        return modelos_fixos
-
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        resp = requests.get(url, timeout=8)
-        if resp.status_code == 200:
-            api_models = resp.json().get("models", [])
-            validos = [
-                m.get("name", "").replace("models/", "")
-                for m in api_models
-                if "generateContent" in m.get("supportedGenerationMethods", [])
-            ]
-            prioritarios = []
-            for m in ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-1.5-pro"]:
-                if m in validos:
-                    prioritarios.append(("v1beta", m))
-            if prioritarios:
-                return prioritarios + modelos_fixos
-    except Exception:
-        pass
-
-    return modelos_fixos
-
 def gerar_diagnostico_gemini(dados_operacoes, api_key):
-    """Gera a análise comercial profunda testando modelos válidos em cascata."""
+    """Gera a análise comercial profunda testando todos os modelos ativos na chave em cascata."""
     if api_key:
         candidatos = obter_modelos_candidatos(api_key)
-        amostra_falas_voz = "\n".join(dados_operacoes["dialogos_clientes_voz"][:30]) if dados_operacoes["dialogos_clientes_voz"] else "Nenhum diálogo com transcrição gravada no dia."
+        amostra_falas_voz = "\n".join(dados_operacoes["dialogos_clientes_voz"][:35]) if dados_operacoes["dialogos_clientes_voz"] else "Nenhum diálogo com transcrição gravada no dia."
         amostra_falas_wpp = "\n\n".join(dados_operacoes["dialogos_wpp"][:15]) if dados_operacoes["dialogos_wpp"] else "Sem conversas de texto do WhatsApp registradas no período."
 
         agentes_resumo = ""
         for ag, s in dados_operacoes["agentes_stats"].items():
             agentes_resumo += f"- {ag}: {s['efetivas']} chamadas atendidas ({s['tempo_str']} em linha, TMA: {s['tma']}) | Vendas: {s['vendas']}, Wpp: {s['wpp']}, Retornos: {s['agend']}, Perdidas: {s['perdidas']}\n"
             if s["exemplos"]:
-                agentes_resumo += f"  Casos e falas de {ag}:\n"
-                for ex in s["exemplos"][:4]:
+                agentes_resumo += f"  Casos e transcrições de {ag}:\n"
+                for ex in s["exemplos"][:5]:
                     agentes_resumo += f"    * {ex}\n"
 
         prompt = f"""Você é o Diretor Comercial e Estrategista Chefe da Fibrart Indústria e Comércio Ltda (fabricante de tanques e pias em marmofibra e fibra de alta resistência).
 Sua missão é realizar uma análise comercial CRÍTICA, DILIGENTE e PROFUNDA do atendimento de ontem ({DATA_ALVO_STR} - {DIA_SEMANA_STR}).
 
-A DIRETORIA DA FIBRART EXIGE QUE SUA ANÁLISE NÃO SEJA RASA OU MERAMENTE ESTATÍSTICA. ELA DEVE OBRIGATORIAMENTE LEVAR EM CONSIDERAÇÃO O CONTEÚDO REAL DAS CHAMADAS E DAS CONVERSAS, OU SEJA, O QUE O CLIENTE ESTÁ DIZENDO E O QUE AS VENDEDORAS ESTÃO DIZENDO.
+A DIRETORIA DA FIBRART EXIGE QUE SUA ANÁLISE NÃO SEJA RASA OU MERAMENTE ESTATÍSTICA. ELA DEVE OBRIGATORIAMENTE LEVAR EM CONSIDERAÇÃO O CONTEÚDO REAL DAS CHAMADAS E DAS TRANSCRIÇÕES, OU SEJA, O QUE O CLIENTE ESTÁ DIZENDO E O QUE AS VENDEDORAS ESTÃO DIZENDO.
 
 DADOS DAS OPERAÇÕES DO DIA:
 - Total de Ligações Efetivas com Conversa Humana: {dados_operacoes['total_efetivas']} de {dados_operacoes['total_disparos']} disparos realizados pelo discador.
@@ -463,17 +689,16 @@ DADOS DAS OPERAÇÕES DO DIA:
 DESEMPENHO DAS VENDEDORAS:
 {agentes_resumo}
 
-EXTRATO DAS FALAS E DIÁLOGOS DAS LIGAÇÕES (VOZ 3C PLUS):
+EXTRATO DAS TRANSCRIÇÕES E DIÁLOGOS DAS LIGAÇÕES (VOZ 3C PLUS):
 {amostra_falas_voz}
 
 EXTRATO DAS CONVERSAS DE WHATSAPP (3C OMNI):
 {amostra_falas_wpp}
 
 INSTRUÇÕES RIGOROSAS:
-1. "voz_do_cliente": Analise o que os lojistas e depósitos estão falando (objeções de frete, concorrência, prazo, estoque, demanda por tanques duplos e pias inox).
+1. "voz_do_cliente": Analise o que os lojistas e depósitos estão falando nas transcrições (objeções de frete, concorrência, prazo, estoque, demanda por tanques duplos e pias inox).
 2. "diagnostico_equipe": Para Fernanda e Julia, analise a POSTURA e o CONTEÚDO dito por cada uma (combatividade, velocidade no WhatsApp, contorno de objeções, TMA).
 3. "justificativa_nota": Justificativa em 2 a 3 parágrafos densos e completos detalhando o desempenho real e onde a equipe deixou de converter.
-4. "plano_acao": 3 a 4 ações comerciais imediatas adaptadas com as quantidades e demandas deste dia.
 
 Retorne EXCLUSIVAMENTE um JSON válido com esta estrutura exata:
 {{
@@ -489,19 +714,9 @@ Retorne EXCLUSIVAMENTE um JSON válido com esta estrutura exata:
     }}
   }},
   "nota_dia": "9.1 / 10",
-  "justificativa_nota": "Primeiro parágrafo...\\n\\nSegundo parágrafo...",
-  "plano_acao": [
-    "Ação 1...",
-    "Ação 2...",
-    "Ação 3..."
-  ]
+  "justificativa_nota": "Primeiro parágrafo...\\n\\nSegundo parágrafo..."
 }}
 """
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2, "response_mime_type": "application/json"}
-        }
-
         modelos_tentados = set()
         for versao, modelo in candidatos:
             par = (versao, modelo)
@@ -511,17 +726,25 @@ Retorne EXCLUSIVAMENTE um JSON válido com esta estrutura exata:
 
             print(f"3. Gerando diagnóstico executivo com Inteligência Artificial (Gemini {versao} - Modelo: {modelo})...")
             url_api = f"https://generativelanguage.googleapis.com/{versao}/models/{modelo}:generateContent?key={api_key}"
+            gen_cfg = {"temperature": 0.2, "response_mime_type": "application/json"} if versao == "v1beta" else {"temperature": 0.2}
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": gen_cfg
+            }
             try:
                 resp = requests.post(url_api, json=payload, headers={"Content-Type": "application/json"}, timeout=45)
                 if resp.status_code == 200:
                     txt = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
                     txt_clean = re.sub(r"^```json\s*", "", txt.strip(), flags=re.MULTILINE)
                     txt_clean = re.sub(r"```$", "", txt_clean.strip(), flags=re.MULTILINE)
+                    m_json = re.search(r"\{.*\}", txt_clean, flags=re.DOTALL)
+                    if m_json:
+                        txt_clean = m_json.group(0)
                     dados_ia = json.loads(txt_clean)
                     print(f"Diagnóstico executivo da IA gerado com sucesso via {modelo}!")
                     return dados_ia
                 else:
-                    print(f"Aviso Gemini ({modelo}): Status {resp.status_code} | {resp.text[:120]}")
+                    print(f"Aviso Gemini ({modelo}): Status {resp.status_code} | {resp.text[:250]}")
             except Exception as e:
                 print(f"Aviso ao consultar {modelo}: {e}")
 
@@ -535,7 +758,6 @@ def fallback_analitico_profundo(dados_operacoes):
     total_efet = dados_operacoes["total_efetivas"]
     total_perd = len(dados_operacoes["negociacoes_perdidas"])
     total_wpp = dados_operacoes["total_wpp_final"]
-    total_agend = len(dados_operacoes["retornos_agendados"])
 
     voz_cliente = (
         "Durante os diálogos ativos com depósitos e lojistas de Minas Gerais, a principal objeção verbalizada pelos compradores "
@@ -568,19 +790,25 @@ def fallback_analitico_profundo(dados_operacoes):
             }
         },
         "nota_dia": "9.1 / 10",
-        "justificativa_nota": justificativa,
-        "plano_acao": [
-            f"Enviar imediatamente o catálogo técnico e a tabela de atacado para as {total_wpp} lojas transferidas para o WhatsApp, acompanhando o retorno com Fernanda e Julia.",
-            f"Ligar pontualmente nos horários agendados com os {total_agend} depósitos de retorno, munido de estimativa de frete já calculada para a região.",
-            f"Executar ação de repescagem com oferta de combos promocionais para as {total_perd} lojas qualificadas como sem interesse, resgatando pedidos de reposição rápida."
-        ]
+        "justificativa_nota": justificativa
     }
 
 # ==============================================================================
-# 4. FORMATAÇÃO DO RELATÓRIO EXECUTIVO OFICIAL FIBRART
+# 5. FORMATAÇÃO DO RELATÓRIO EXECUTIVO OFICIAL FIBRART
 # ==============================================================================
+def formatar_item_chamada(idx, item):
+    """Formata uma linha de chamada incluindo nome da loja, cidade, telefone e transcrição se houver."""
+    cid_str = f" ({item['cidade']})" if item.get("cidade") else ""
+    num_str = f" [{item['numero']}]" if item.get("numero") and item["numero"] != item["cliente"] else ""
+    base = f"{idx}. **{item['cliente']}**{cid_str}{num_str} — Vendedora: {item['agente']} | Duração: {item['duracao']}"
+    if item.get("transcricao"):
+        base += f"\n  * 🎙️ *Transcrição:* {item['transcricao']}"
+    elif item.get("nota"):
+        base += f"\n  * 📝 *Nota:* {item['nota']}"
+    return base
+
 def formatar_relatorio(dados_operacoes, analise_ia):
-    """Formata o relatório com base no padrão estrito adotado no Google Docs oficial da Fibrart."""
+    """Formata o relatório enxuto e focado no padrão oficial adotado no Google Docs da Fibrart."""
     linhas = []
     linhas.append(f"📅 Registro Consolidado — {DATA_ALVO_STR} ({DIA_SEMANA_STR})")
     linhas.append("📊 Visão Geral das Operações (Voz & WhatsApp Omni)")
@@ -589,7 +817,8 @@ def formatar_relatorio(dados_operacoes, analise_ia):
     linhas.append(f"- Pessoas Atendidas por WhatsApp: {dados_operacoes['total_wpp_final']} empresas encaminhadas diretamente pelo telefone para envio de tabela e catálogo.")
     linhas.append(f"- Tempo Total em Ligação: {dados_operacoes['tempo_total_str']} de diálogo ativo com lojistas e depósitos.")
     linhas.append(f"- 🏆 Vendas Fechadas por Telefone: {len(dados_operacoes['vendas_fechadas'])} pedidos confirmados.")
-    linhas.append(f"- Retornos e Cotações Agendadas: {len(dados_operacoes['retornos_agendados'])} lojistas aguardando recontato.\n")
+    linhas.append(f"- Retornos e Cotações Agendadas: {len(dados_operacoes['retornos_agendados'])} lojistas aguardando recontato.")
+    linhas.append(f"- Ligações Auditadas com Áudio Transcrito: {len(dados_operacoes.get('transcricoes_realizadas', []))} diálogos transcritos.\n")
 
     linhas.append("🗣️ Análise Qualitativa dos Diálogos (Voz do Cliente & Postura Comercial)")
     linhas.append(f"{analise_ia.get('voz_do_cliente', 'Os lojistas apresentaram demandas de reposição de tanques e pias, apontando preocupações com prazos de entrega e valor de frete.')}\n")
@@ -597,29 +826,19 @@ def formatar_relatorio(dados_operacoes, analise_ia):
     linhas.append(f"🏆 Vendas Fechadas por Telefone ({len(dados_operacoes['vendas_fechadas'])} Pedidos)")
     if dados_operacoes["vendas_fechadas"]:
         for idx, v in enumerate(dados_operacoes["vendas_fechadas"], 1):
-            cid_str = f" ({v['cidade']})" if v['cidade'] else ""
-            linhas.append(f"{idx}. {v['cliente']}{cid_str} — Vendedora: {v['agente']} | Duração: {v['duracao']}")
+            linhas.append(formatar_item_chamada(idx, v))
     else:
         linhas.append("- Nenhuma venda fechada diretamente por telefone na data (foco em prospecção, cotação e alinhamento de tabela).")
     linhas.append("")
 
-    linhas.append(f"📲 Leads Transferidos para o WhatsApp ({len(dados_operacoes['leads_whatsapp'])} Lojas)")
-    if dados_operacoes["leads_whatsapp"]:
-        for idx, w in enumerate(dados_operacoes["leads_whatsapp"][:15], 1):
-            cid_str = f" ({w['cidade']})" if w['cidade'] else ""
-            linhas.append(f"{idx}. {w['cliente']}{cid_str} — Vendedora: {w['agente']} | Duração: {w['duracao']}")
-    else:
-        linhas.append("- Nenhum lead registrado com tabulação direta de WhatsApp na data.")
-    linhas.append("")
-
-    linhas.append(f"📅 Agendamentos de Retorno Prioritários ({len(dados_operacoes['retornos_agendados'])} Lojas)")
-    if dados_operacoes["retornos_agendados"]:
-        for idx, a in enumerate(dados_operacoes["retornos_agendados"][:15], 1):
-            cid_str = f" ({a['cidade']})" if a['cidade'] else ""
-            linhas.append(f"{idx}. {a['cliente']}{cid_str} — Vendedora: {a['agente']} | Duração: {a['duracao']}")
-    else:
-        linhas.append("- Sem retornos agendados pendentes na data.")
-    linhas.append("")
+    # Seção dedicada de transcrições das ligações auditadas
+    transcricoes = dados_operacoes.get("transcricoes_realizadas", [])
+    if transcricoes:
+        linhas.append(f"🎙️ Amostra de Transcrições das Ligações ({len(transcricoes)} Diálogos Auditados)")
+        for idx, t in enumerate(transcricoes[:12], 1):
+            cid_str = f" ({t['cidade']})" if t.get("cidade") else ""
+            linhas.append(f"{idx}. **{t['cliente']}**{cid_str} [{t['qualificacao']} | {t['duracao']}] — {t['agente']}: {t['transcricao']}")
+        linhas.append("")
 
     linhas.append("👩💼 Desempenho e Diagnóstico da Equipe")
     diag_ag = analise_ia.get("diagnostico_equipe", {})
@@ -633,23 +852,13 @@ def formatar_relatorio(dados_operacoes, analise_ia):
 
     linhas.append("⭐ Avaliação Geral da Operação")
     linhas.append(f"- Nota do Dia: {analise_ia.get('nota_dia', '9.1 / 10')}")
-    linhas.append(f"- Justificativa da Avaliação:\n{analise_ia.get('justificativa_nota', 'A avaliação reflete a consistência da operação no contato com os depósitos e a postura comercial das vendedoras.')}\n")
-
-    linhas.append("💡 Plano de Ação Comercial Imediato para o Próximo Dia Útil")
-    plano = analise_ia.get("plano_acao", [])
-    if plano:
-        for idx, p in enumerate(plano, 1):
-            linhas.append(f"{idx}. {p}")
-    else:
-        linhas.append("1. Realizar acompanhamento dos lojistas encaminhados para o WhatsApp com tabela e catálogo.")
-        linhas.append("2. Ligar pontualmente para os contatos agendados.")
-        linhas.append("3. Alinhar com a fábrica a rota de entrega da semana.")
+    linhas.append(f"- Justificativa da Avaliação:\n{analise_ia.get('justificativa_nota', 'A avaliação reflete a consistência da operação no contato com os depósitos e a postura comercial das vendedoras.')}")
 
     linhas.append("\n________________\n")
     return "\n".join(linhas)
 
 # ==============================================================================
-# 5. PUBLICAÇÃO NO GOOGLE DOCS VIA WEBHOOK
+# 6. PUBLICAÇÃO NO GOOGLE DOCS VIA WEBHOOK
 # ==============================================================================
 def publicar_google_docs(texto_relatorio, webhook_url):
     """Envia o relatório consolidado para o Google Docs oficial via Webhook."""
@@ -693,8 +902,8 @@ def main():
     chamadas = coletar_chamadas_3c(TOKEN_3C_PLUS, DATA_ALVO_ISO)
     omni_chats = coletar_whatsapp_3c(TOKEN_3C_PLUS, DATA_ALVO_ISO)
 
-    print("2. Calculando métricas e extraindo diálogos e falas de clientes e agentes...")
-    dados_operacoes = processar_operacoes(chamadas, omni_chats)
+    print("2. Calculando métricas, desempacotando mailing e transcrevendo áudios das ligações...")
+    dados_operacoes = processar_operacoes(chamadas, omni_chats, TOKEN_3C_PLUS, GEMINI_API_KEY)
 
     analise_ia = gerar_diagnostico_gemini(dados_operacoes, GEMINI_API_KEY)
 
