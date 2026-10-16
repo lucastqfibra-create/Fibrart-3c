@@ -2,17 +2,25 @@ name: Relatório Diário 3C Plus & Gemini
 
 on:
   schedule:
-    # 09:15 UTC = 06:15 Horário de Brasília (Terça a Sábado)
-    - cron: '15 9 * * 2-6'
+    # 09:36 UTC = EXATAMENTE 06:36 da manhã de Brasília (UTC-3)
+    # O asterisco final (*) garante que rode TODOS os dias
+    - cron: '36 9 * * *'
   workflow_dispatch:
     inputs:
       data_manual:
-        description: 'Data opcional para processar (DD/MM/YYYY)'
+        description: 'Data manual opcional (DD/MM/YYYY)'
         required: false
         default: ''
+
+concurrency:
+  group: relatorio-diario-fibrart
+  cancel-in-progress: false
+
 jobs:
   executar-analise:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
       - name: Baixar código do repositório
         uses: actions/checkout@v4
@@ -21,15 +29,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Instalar dependências
         run: |
-          pip install requests google-generativeai
+          pip install requests
 
       - name: Executar Consolidação e Envio ao Google Docs
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TOKEN_3C_PLUS: ${{ secrets.TOKEN_3C_PLUS }}
           GOOGLE_DOCS_WEBHOOK_URL: ${{ secrets.GOOGLE_DOCS_WEBHOOK_URL }}
+          DATA_MANUAL: ${{ github.event.inputs.data_manual }}
+          DURACAO_MINIMA_SEGUNDOS: 12
+          MAX_TRANSCRICOES: 35
         run: |
           python main.py
